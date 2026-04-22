@@ -1,0 +1,130 @@
+# ─────────────────────────────────────────────────────────────
+# Football Match Prediction – Central Configuration
+# ─────────────────────────────────────────────────────────────
+
+project:
+  name: "football-match-prediction"
+  version: "0.1.0"
+  random_seed: 42
+
+# ── Data ──────────────────────────────────────────────────────
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  external_dir: "data/external"
+
+  # Football-Data.co.uk league codes
+  leagues:
+    - name: "Premier League"
+      code: "E0"
+      country: "England"
+    - name: "La Liga"
+      code: "SP1"
+      country: "Spain"
+    - name: "Bundesliga"
+      code: "D1"
+      country: "Germany"
+    - name: "Serie A"
+      code: "I1"
+      country: "Italy"
+    - name: "Ligue 1"
+      code: "F1"
+      country: "France"
+
+  seasons:
+    - "2021-22"
+    - "2022-23"
+    - "2023-24"
+
+  # Football-Data.co.uk base URL template
+  football_data_url: "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
+
+# ── Feature Engineering ───────────────────────────────────────
+features:
+  form_window: 5          # Last N matches for rolling form
+  elo_k_factor: 32        # Elo K-factor
+  elo_initial_rating: 1500
+  elo_home_advantage: 100  # Home advantage in Elo points
+  time_decay_half_life: 30  # Days – exponential decay half-life
+
+  rolling_stats:
+    - "goals_scored"
+    - "goals_conceded"
+    - "shots"
+    - "shots_on_target"
+    - "corners"
+    - "fouls"
+
+  target_column: "result"   # H / D / A
+  feature_columns:
+    - "home_elo"
+    - "away_elo"
+    - "elo_diff"
+    - "home_form"
+    - "away_form"
+    - "home_goals_scored_avg"
+    - "home_goals_conceded_avg"
+    - "away_goals_scored_avg"
+    - "away_goals_conceded_avg"
+    - "home_shots_avg"
+    - "away_shots_avg"
+    - "home_shots_on_target_avg"
+    - "away_shots_on_target_avg"
+    - "home_corners_avg"
+    - "away_corners_avg"
+
+# ── Models ────────────────────────────────────────────────────
+models:
+  output_dir: "models"
+  test_size: 0.2
+  cv_folds: 5
+
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+    solver: "lbfgs"
+
+  random_forest:
+    n_estimators: 200
+    max_depth: 10
+    min_samples_split: 5
+    min_samples_leaf: 2
+    n_jobs: -1
+
+  xgboost:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    use_label_encoder: false
+    eval_metric: "mlogloss"
+
+  lightgbm:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 6
+    num_leaves: 63
+    subsample: 0.8
+    colsample_bytree: 0.8
+    verbosity: -1
+
+# ── MLflow ────────────────────────────────────────────────────
+mlflow:
+  tracking_uri: "mlruns"
+  experiment_name: "football-match-prediction"
+
+# ── API ───────────────────────────────────────────────────────
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: true
+  model_path: "models/best_model.joblib"
+  scaler_path: "models/scaler.joblib"
+  label_encoder_path: "models/label_encoder.joblib"
+
+# ── Logging ───────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  log_dir: "logs"
