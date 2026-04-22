@@ -2,23 +2,6 @@
 src/models/train.py
 -------------------
 Train multiple classifiers and log experiments to MLflow.
-
-Models
-------
-* Logistic Regression  (baseline)
-* Random Forest
-* XGBoost
-* LightGBM
-
-Metrics logged
---------------
-* Accuracy
-* Log-loss
-* Brier score (multi-class macro)
-* Cross-validation mean / std for each metric
-
-Run as a module:
-    python -m src.models.train
 """
 
 from __future__ import annotations
@@ -37,8 +20,8 @@ from loguru import logger
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import TimeSeriesSplit, cross_validate
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 from src.utils.helpers import ensure_dir, load_config, set_seed
@@ -47,12 +30,6 @@ from src.utils.helpers import ensure_dir, load_config, set_seed
 # ─── Brier Score ─────────────────────────────────────────────────────────────
 
 def brier_score_multiclass(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    """
-    Multi-class Brier score (macro average across classes).
-
-    BS = (1/N) * sum_i sum_k (p_ik - o_ik)^2
-    where o_ik is 1 if sample i belongs to class k else 0.
-    """
     n_classes = y_prob.shape[1]
     n_samples = len(y_true)
     total = 0.0
@@ -65,7 +42,6 @@ def brier_score_multiclass(y_true: np.ndarray, y_prob: np.ndarray) -> float:
 # ─── Model definitions ───────────────────────────────────────────────────────
 
 def get_models(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Instantiate all models from config."""
     m_cfg = cfg["models"]
     return {
         "logistic_regression": LogisticRegression(
@@ -77,9 +53,7 @@ def get_models(cfg: dict[str, Any]) -> dict[str, Any]:
         "random_forest": RandomForestClassifier(
             n_estimators=m_cfg["random_forest"]["n_estimators"],
             max_depth=m_cfg["random_forest"]["max_depth"],
-            min_samples_split=m_cfg["random_forest"]["min_samples_split"],
-            min_samples_leaf=m_cfg["random_forest"]["min_samples_leaf"],
-            n_jobs=m_cfg["random_forest"]["n_jobs"],
+            n_jobs=-1,
             random_state=cfg["project"]["random_seed"],
         ),
         "xgboost": XGBClassifier(
@@ -89,7 +63,6 @@ def get_models(cfg: dict[str, Any]) -> dict[str, Any]:
             subsample=m_cfg["xgboost"]["subsample"],
             colsample_bytree=m_cfg["xgboost"]["colsample_bytree"],
             eval_metric="mlogloss",
-            use_label_encoder=False,
             random_state=cfg["project"]["random_seed"],
         ),
         "lightgbm": LGBMClassifier(
@@ -97,15 +70,12 @@ def get_models(cfg: dict[str, Any]) -> dict[str, Any]:
             learning_rate=m_cfg["lightgbm"]["learning_rate"],
             max_depth=m_cfg["lightgbm"]["max_depth"],
             num_leaves=m_cfg["lightgbm"]["num_leaves"],
-            subsample=m_cfg["lightgbm"]["subsample"],
-            colsample_bytree=m_cfg["lightgbm"]["colsample_bytree"],
-            verbosity=-1,
             random_state=cfg["project"]["random_seed"],
         ),
     }
 
 
-# ─── Feature & target extraction ─────────────────────────────────────────────
+# ─── Feature columns ─────────────────────────────────────────────────────────
 
 FEATURE_COLS = [
     "home_elo", "away_elo", "elo_diff",
@@ -116,75 +86,81 @@ FEATURE_COLS = [
     "home_shots_avg", "away_shots_avg",
     "home_shots_on_target_avg", "away_shots_on_target_avg",
     "home_corners_avg", "away_corners_avg",
+    "home_rest_days", "away_rest_days",
+    "elo_form_interaction",
 ]
 
 
+# ─── Data preparation (TIME-AWARE) ───────────────────────────────────────────
+
 def prepare_data(
     df: pd.DataFrame,
-    feature_cols: list[str] | None = None,
-    target_col: str = "result_label",
-    test_size: float = 0.2,
-    random_seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, StandardScaler, list[str]]:
-    """
-    Extract features and target, drop NaNs, scale, split.
+    feature_cols: list[str],
+    test_size: float,
+):
+    df = df.sort_values("date").reset_index(drop=True)
 
-    Returns
-    -------
-    X_train, X_test, y_train, y_test, fitted_scaler, used_feature_cols
-    """
-    feature_cols = feature_cols or FEATURE_COLS
-    available_cols = [c for c in feature_cols if c in df.columns]
-    if not available_cols:
-        raise ValueError("No feature columns found in DataFrame.")
+    sub = df[feature_cols + ["target"]].dropna()
 
-    sub = df[available_cols + [target_col]].dropna()
-    X = sub[available_cols].values
-    y = sub[target_col].values.astype(int)
+    split_idx = int(len(sub) * (1 - test_size))
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_seed, stratify=y
-    )
+    train_df = sub.iloc[:split_idx]
+    test_df = sub.iloc[split_idx:]
+
+    X_train = train_df[feature_cols].values
+    y_train = train_df["target"].values.astype(int)
+
+    X_test = test_df[feature_cols].values
+    y_test = test_df["target"].values.astype(int)
 
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
-    return X_train, X_test, y_train, y_test, scaler, available_cols
+    return X_train, X_test, X_train_scaled, X_test_scaled, y_train, y_test, scaler
 
 
-# ─── Training & evaluation loop ──────────────────────────────────────────────
+# ─── Training & evaluation ───────────────────────────────────────────────────
 
 def evaluate_model(
+    name: str,
     model: Any,
-    X_train: np.ndarray,
-    X_test: np.ndarray,
-    y_train: np.ndarray,
-    y_test: np.ndarray,
-    cv_folds: int = 5,
-    random_seed: int = 42,
-) -> dict[str, float]:
-    """Train model, evaluate on held-out test set and with cross-validation."""
+    X_train,
+    X_test,
+    X_train_scaled,
+    X_test_scaled,
+    y_train,
+    y_test,
+    cv_folds,
+):
     start = time.time()
-    model.fit(X_train, y_train)
-    elapsed = time.time() - start
 
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)
+    # Use scaled data only for Logistic Regression
+    if name == "logistic_regression":
+        model.fit(X_train_scaled, y_train)
+        y_pred = model.predict(X_test_scaled)
+        y_prob = model.predict_proba(X_test_scaled)
+        X_cv = X_train_scaled
+    else:
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)
+        X_cv = X_train
+
+    elapsed = time.time() - start
 
     acc = accuracy_score(y_test, y_pred)
     ll = log_loss(y_test, y_prob)
     bs = brier_score_multiclass(y_test, y_prob)
 
-    # Cross-validation on training set
-    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
+    # Time-aware CV
+    tscv = TimeSeriesSplit(n_splits=cv_folds)
     cv_results = cross_validate(
         model.__class__(**model.get_params()),
-        X_train,
+        X_cv,
         y_train,
-        cv=cv,
+        cv=tscv,
         scoring=["accuracy", "neg_log_loss"],
-        return_train_score=False,
     )
 
     return {
@@ -193,92 +169,71 @@ def evaluate_model(
         "brier_score": bs,
         "train_time_s": elapsed,
         "cv_accuracy_mean": float(np.mean(cv_results["test_accuracy"])),
-        "cv_accuracy_std": float(np.std(cv_results["test_accuracy"])),
         "cv_log_loss_mean": float(-np.mean(cv_results["test_neg_log_loss"])),
-        "cv_log_loss_std": float(np.std(cv_results["test_neg_log_loss"])),
     }
 
 
-# ─── Main entry point ─────────────────────────────────────────────────────────
+# ─── Main ────────────────────────────────────────────────────────────────────
 
 def main(config_path: str | Path = "configs/config.yaml") -> None:
-    """Train all models, compare, save the best one."""
     cfg = load_config(config_path)
     set_seed(cfg["project"]["random_seed"])
 
-    processed_dir = Path(cfg["data"]["processed_dir"])
-    features_path = processed_dir / "matches_features.csv"
-    if not features_path.exists():
-        raise FileNotFoundError(
-            f"Feature file not found: {features_path}. "
-            "Run the data pipeline first: python -m src.data.pipeline"
-        )
-
-    df = pd.read_csv(features_path, parse_dates=["date"])
-    logger.info(f"Loaded feature dataset: {len(df)} rows")
+    df = pd.read_csv(
+        Path(cfg["data"]["processed_dir"]) / "matches_features.csv",
+        parse_dates=["date"],
+    )
 
     models_dir = ensure_dir(cfg["models"]["output_dir"])
 
-    # MLflow setup
     mlflow.set_tracking_uri(cfg["mlflow"]["tracking_uri"])
     mlflow.set_experiment(cfg["mlflow"]["experiment_name"])
 
-    X_train, X_test, y_train, y_test, scaler, feat_cols = prepare_data(
+    X_train, X_test, X_train_scaled, X_test_scaled, y_train, y_test, scaler = prepare_data(
         df,
-        test_size=cfg["models"]["test_size"],
-        random_seed=cfg["project"]["random_seed"],
+        FEATURE_COLS,
+        cfg["models"]["test_size"],
     )
-    logger.info(f"Train: {len(X_train)}, Test: {len(X_test)}, Features: {len(feat_cols)}")
 
     models = get_models(cfg)
-    results: dict[str, dict[str, float]] = {}
+    results = {}
 
     for name, model in models.items():
-        logger.info(f"Training {name}…")
+        logger.info(f"Training {name}...")
+
         with mlflow.start_run(run_name=name):
-            mlflow.log_params(model.get_params())
             metrics = evaluate_model(
+                name,
                 model,
-                X_train, X_test, y_train, y_test,
-                cv_folds=cfg["models"]["cv_folds"],
-                random_seed=cfg["project"]["random_seed"],
-            )
-            mlflow.log_metrics(metrics)
-            mlflow.sklearn.log_model(model, artifact_path=name)
-            results[name] = metrics
-            logger.info(
-                f"  {name}: acc={metrics['accuracy']:.4f}, "
-                f"log_loss={metrics['log_loss']:.4f}, "
-                f"brier={metrics['brier_score']:.4f}"
+                X_train, X_test,
+                X_train_scaled, X_test_scaled,
+                y_train, y_test,
+                cfg["models"]["cv_folds"],
             )
 
-    # ── Save the best model (lowest log-loss on test set) ────────────────────
+            mlflow.log_params(model.get_params())
+            mlflow.log_metrics(metrics)
+            mlflow.sklearn.log_model(model, artifact_path=name)
+
+            results[name] = metrics
+
+    # ── Select best model ────────────────────────────────────────────────────
     best_name = min(results, key=lambda n: results[n]["log_loss"])
     best_model = models[best_name]
 
-    # Refit on full training data
-    best_model.fit(X_train, y_train)
+    # Retrain on FULL data
+    X_full = np.vstack([X_train, X_test])
+    y_full = np.concatenate([y_train, y_test])
+
+    best_model.fit(X_full, y_full)
 
     joblib.dump(best_model, models_dir / "best_model.joblib")
     joblib.dump(scaler, models_dir / "scaler.joblib")
 
-    le = LabelEncoder().fit(["H", "D", "A"])
-    joblib.dump(le, models_dir / "label_encoder.joblib")
+    logger.success(f"Best model: {best_name} saved.")
 
-    # Save feature column list
-    with open(models_dir / "feature_columns.txt", "w") as fh:
-        fh.write("\n".join(feat_cols))
-
-    logger.success(
-        f"Best model: {best_name} (log_loss={results[best_name]['log_loss']:.4f}). "
-        f"Saved to {models_dir}."
-    )
-
-    # Print comparison table
-    summary = pd.DataFrame(results).T[
-        ["accuracy", "log_loss", "brier_score", "cv_accuracy_mean"]
-    ]
-    logger.info(f"\nModel Comparison:\n{summary.to_string()}")
+    summary = pd.DataFrame(results).T
+    logger.info(f"\n{summary}")
 
 
 if __name__ == "__main__":

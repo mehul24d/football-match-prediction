@@ -2,27 +2,15 @@
 api/main.py
 -----------
 FastAPI application for football match outcome prediction.
-
-Endpoints
----------
-GET  /health          – health check + model status
-POST /predict         – predict a single match
-POST /predict/batch   – predict multiple matches from JSON list
-
-Start the server
-----------------
-    uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-    # or
-    make run-api
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, List
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -34,38 +22,35 @@ from api.schemas import (
 )
 from src.utils.helpers import load_config
 
-# ─── Application state ───────────────────────────────────────────────────────
 
-_predictor: Any = None
-_config: dict = {}
-
+# ─── Lifespan (startup/shutdown) ─────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model on startup; clean up on shutdown."""
-    global _predictor, _config
+    """Load model at startup."""
     try:
-        _config = load_config("configs/config.yaml")
+        config = load_config("configs/config.yaml")
         from src.models.predict import Predictor
-        _predictor = Predictor(config_path="configs/config.yaml")
+
+        app.state.config = config
+        app.state.predictor = Predictor(config_path="configs/config.yaml")
+
         logger.success("Model loaded successfully.")
-    except FileNotFoundError as exc:
-        logger.warning(
-            f"Model not found – prediction endpoints will return 503. Details: {exc}"
-        )
+    except Exception as exc:
+        logger.error(f"Failed to load model: {exc}")
+        app.state.predictor = None
+
     yield
+
     logger.info("Shutting down API.")
 
 
-# ─── App factory ──────────────────────────────────────────────────────────────
+# ─── App ─────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Football Match Prediction API",
-    description=(
-        "Production-grade REST API for predicting football (soccer) match outcomes. "
-        "Returns win/draw/loss probabilities for home and away teams."
-    ),
     version="1.0.0",
+    description="Predict football match outcomes using ML models",
     lifespan=lifespan,
 )
 
@@ -80,30 +65,24 @@ app.add_middleware(
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _require_model() -> None:
-    if _predictor is None:
+def get_predictor(request: Request):
+    predictor = request.app.state.predictor
+    if predictor is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Prediction model is not loaded. "
-                "Train the model first: python -m src.models.train"
-            ),
+            detail="Model not loaded. Train model first.",
         )
+    return predictor
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
 
-@app.get(
-    "/health",
-    response_model=HealthResponse,
-    summary="Health check",
-    tags=["Utility"],
-)
-async def health() -> HealthResponse:
-    """Returns API health status and whether the prediction model is loaded."""
+@app.get("/health", response_model=HealthResponse, tags=["Utility"])
+async def health(request: Request):
+    """Check API + model status."""
     return HealthResponse(
         status="ok",
-        model_loaded=_predictor is not None,
+        model_loaded=request.app.state.predictor is not None,
         version="1.0.0",
     )
 
@@ -111,94 +90,93 @@ async def health() -> HealthResponse:
 @app.post(
     "/predict",
     response_model=PredictionResponse,
-    summary="Predict single match outcome",
     tags=["Prediction"],
-    responses={
-        503: {"model": ErrorResponse, "description": "Model not loaded"},
-        422: {"description": "Validation error"},
-    },
+    responses={503: {"model": ErrorResponse}},
 )
-async def predict(request: MatchFeaturesRequest) -> PredictionResponse:
-    """
-    Predict the outcome probabilities (Home Win / Draw / Away Win)
-    for a single football match.
-    """
-    _require_model()
-    features = request.to_feature_dict()
+async def predict(request_data: MatchFeaturesRequest, request: Request):
+    """Predict a single match outcome."""
+    predictor = get_predictor(request)
+
     try:
-        result = _predictor.predict(features)
-    except Exception as exc:
-        logger.error(f"Prediction error: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Prediction failed: {exc}",
+        features = request_data.to_feature_dict()
+        result = predictor.predict(features)
+
+        return PredictionResponse(
+            home_team=request_data.home_team,
+            away_team=request_data.away_team,
+            home_win_prob=float(result["home_win_prob"]),
+            draw_prob=float(result["draw_prob"]),
+            away_win_prob=float(result["away_win_prob"]),
+            predicted_outcome=str(result["predicted_outcome"]),
         )
-    return PredictionResponse(
-        home_team=request.home_team,
-        away_team=request.away_team,
-        home_win_prob=result["home_win_prob"],
-        draw_prob=result["draw_prob"],
-        away_win_prob=result["away_win_prob"],
-        predicted_outcome=result["predicted_outcome"],
-    )
+
+    except Exception as exc:
+        logger.exception("Prediction failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {str(exc)}",
+        )
 
 
 @app.post(
     "/predict/batch",
-    response_model=list[PredictionResponse],
-    summary="Predict multiple matches",
+    response_model=List[PredictionResponse],
     tags=["Prediction"],
-    responses={
-        503: {"model": ErrorResponse, "description": "Model not loaded"},
-    },
+    responses={503: {"model": ErrorResponse}},
 )
-async def predict_batch(requests: list[MatchFeaturesRequest]) -> list[PredictionResponse]:
-    """
-    Predict outcome probabilities for a list of matches in a single call.
-    """
-    if not requests:
+async def predict_batch(
+    request_list: List[MatchFeaturesRequest],
+    request: Request,
+):
+    """Predict multiple matches."""
+    if not request_list:
         return []
 
-    _require_model()
-    records = [r.to_feature_dict() for r in requests]
-    df = pd.DataFrame(records)
+    predictor = get_predictor(request)
 
     try:
-        df_out = _predictor.predict_batch(df)
-    except Exception as exc:
-        logger.error(f"Batch prediction error: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch prediction failed: {exc}",
-        )
+        records = [r.to_feature_dict() for r in request_list]
+        df = pd.DataFrame(records)
 
-    responses = []
-    for req, (_, row) in zip(requests, df_out.iterrows()):
-        responses.append(
-            PredictionResponse(
-                home_team=req.home_team,
-                away_team=req.away_team,
-                home_win_prob=float(row["home_win_prob"]),
-                draw_prob=float(row["draw_prob"]),
-                away_win_prob=float(row["away_win_prob"]),
-                predicted_outcome=str(row["predicted_outcome"]),
+        df_out = predictor.predict_batch(df)
+
+        responses = []
+        for req, row in zip(request_list, df_out.to_dict(orient="records")):
+            responses.append(
+                PredictionResponse(
+                    home_team=req.home_team,
+                    away_team=req.away_team,
+                    home_win_prob=float(row["home_win_prob"]),
+                    draw_prob=float(row["draw_prob"]),
+                    away_win_prob=float(row["away_win_prob"]),
+                    predicted_outcome=str(row["predicted_outcome"]),
+                )
             )
+
+        return responses
+
+    except Exception as exc:
+        logger.exception("Batch prediction failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Batch prediction failed: {str(exc)}",
         )
-    return responses
 
 
 # ─── Dev runner ──────────────────────────────────────────────────────────────
 
 def start() -> None:
-    """Entry point for `fmp-api` CLI command."""
+    """Run API via CLI."""
     import uvicorn
+
     cfg = load_config("configs/config.yaml")
     api_cfg = cfg.get("api", {})
+
     uvicorn.run(
         "api.main:app",
         host=api_cfg.get("host", "0.0.0.0"),
         port=api_cfg.get("port", 8000),
-        reload=api_cfg.get("reload", False),
+        reload=api_cfg.get("reload", True),
     )
 
 

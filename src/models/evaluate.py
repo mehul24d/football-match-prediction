@@ -1,16 +1,7 @@
 """
 src/models/evaluate.py
 -----------------------
-Evaluation utilities for match prediction models.
-
-Metrics
--------
-* Accuracy
-* Log-loss (lower is better)
-* Brier score (lower is better)
-* Confusion matrix
-* Calibration plot data
-* SHAP feature importance
+Robust evaluation utilities for match prediction models.
 """
 
 from __future__ import annotations
@@ -23,7 +14,6 @@ import pandas as pd
 from loguru import logger
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
-    ConfusionMatrixDisplay,
     accuracy_score,
     classification_report,
     confusion_matrix,
@@ -33,7 +23,7 @@ from sklearn.metrics import (
 from src.models.train import brier_score_multiclass
 
 
-# ─── Core metric bundle ──────────────────────────────────────────────────────
+# ─── Core Metrics ────────────────────────────────────────────────────────────
 
 def compute_metrics(
     y_true: np.ndarray,
@@ -41,27 +31,28 @@ def compute_metrics(
     y_prob: np.ndarray,
     class_names: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """
-    Compute a full set of evaluation metrics.
+    """Compute evaluation metrics safely."""
 
-    Parameters
-    ----------
-    y_true       : integer ground-truth labels
-    y_pred       : integer predicted labels
-    y_prob       : probability matrix (n_samples × n_classes)
-    class_names  : list of human-readable class names (e.g. ['Home', 'Draw', 'Away'])
+    if y_prob.ndim != 2:
+        raise ValueError("y_prob must be 2D array (n_samples × n_classes)")
 
-    Returns
-    -------
-    Dictionary with accuracy, log_loss, brier_score, and classification_report.
-    """
+    if len(y_true) != len(y_pred):
+        raise ValueError("Mismatch in y_true and y_pred length")
+
     class_names = class_names or ["Home Win", "Draw", "Away Win"]
+
     acc = accuracy_score(y_true, y_pred)
     ll = log_loss(y_true, y_prob)
     bs = brier_score_multiclass(y_true, y_prob)
 
+    cm = confusion_matrix(y_true, y_pred)
+
     report = classification_report(
-        y_true, y_pred, target_names=class_names, output_dict=True
+        y_true,
+        y_pred,
+        target_names=class_names,
+        output_dict=True,
+        zero_division=0,
     )
 
     logger.info(
@@ -73,7 +64,7 @@ def compute_metrics(
         "log_loss": ll,
         "brier_score": bs,
         "classification_report": report,
-        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+        "confusion_matrix": cm.tolist(),
     }
 
 
@@ -86,20 +77,27 @@ def calibration_data(
     n_bins: int = 10,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Return (mean_predicted_prob, fraction_of_positives) for a reliability plot.
-
-    Parameters
-    ----------
-    class_idx : which class (0=Home win, 1=Draw, 2=Away win)
+    Returns:
+    -------
+    prob_pred : predicted probabilities (x-axis)
+    prob_true : actual fraction (y-axis)
     """
+    if class_idx >= y_prob.shape[1]:
+        raise ValueError("Invalid class index")
+
     y_binary = (y_true == class_idx).astype(int)
+
     prob_true, prob_pred = calibration_curve(
-        y_binary, y_prob[:, class_idx], n_bins=n_bins, strategy="uniform"
+        y_binary,
+        y_prob[:, class_idx],
+        n_bins=n_bins,
+        strategy="uniform",
     )
+
     return prob_pred, prob_true
 
 
-# ─── SHAP explainability ─────────────────────────────────────────────────────
+# ─── SHAP Explainability ─────────────────────────────────────────────────────
 
 def shap_feature_importance(
     model: Any,
@@ -108,55 +106,48 @@ def shap_feature_importance(
     max_display: int = 15,
     output_dir: Optional[str | Path] = None,
 ) -> pd.DataFrame:
-    """
-    Compute SHAP values and return a feature importance DataFrame.
+    """Compute SHAP importance safely (fast + robust)."""
 
-    For tree-based models (RF, XGBoost, LightGBM) uses TreeExplainer;
-    falls back to KernelExplainer otherwise.
-
-    Parameters
-    ----------
-    model         : fitted sklearn-compatible classifier
-    X             : feature matrix (numpy array)
-    feature_names : list of feature names matching X columns
-    max_display   : top-N features to include in the output
-    output_dir    : if provided, saves a SHAP summary plot here
-
-    Returns
-    -------
-    DataFrame with columns [feature, importance_mean_abs]
-    """
     try:
         import shap
     except ImportError:
         logger.warning("SHAP not installed. Run: pip install shap")
         return pd.DataFrame()
 
+    # Sample data for performance
+    if X.shape[0] > 2000:
+        idx = np.random.choice(len(X), 2000, replace=False)
+        X_sample = X[idx]
+    else:
+        X_sample = X
+
     try:
         explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X)
+        shap_values = explainer.shap_values(X_sample)
     except Exception:
-        logger.warning("TreeExplainer failed, using KernelExplainer (may be slow).")
-        background = shap.kmeans(X, 10)
+        logger.warning("TreeExplainer failed, falling back to KernelExplainer.")
+        background = shap.sample(X_sample, 100)
         explainer = shap.KernelExplainer(model.predict_proba, background)
-        shap_values = explainer.shap_values(X)
+        shap_values = explainer.shap_values(X_sample[:200])  # limit for speed
 
-    # For multi-class, shap_values is a list; average absolute value across classes
+    # Handle multi-class output safely
     if isinstance(shap_values, list):
-        mean_abs = np.mean(
-            [np.abs(sv).mean(axis=0) for sv in shap_values], axis=0
-        )
+        stacked = np.stack([np.abs(sv).mean(axis=0) for sv in shap_values])
+        mean_abs = stacked.mean(axis=0)
     else:
         mean_abs = np.abs(shap_values).mean(axis=0)
 
-    importance_df = pd.DataFrame(
-        {"feature": feature_names, "importance_mean_abs": mean_abs}
-    ).sort_values("importance_mean_abs", ascending=False).head(max_display)
+    importance_df = pd.DataFrame({
+        "feature": feature_names,
+        "importance_mean_abs": mean_abs,
+    }).sort_values("importance_mean_abs", ascending=False).head(max_display)
 
     if output_dir:
         import matplotlib.pyplot as plt
+
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
         plt.figure(figsize=(10, 6))
         plt.barh(
             importance_df["feature"][::-1],
@@ -167,30 +158,29 @@ def shap_feature_importance(
         plt.tight_layout()
         plt.savefig(output_dir / "shap_importance.png", dpi=150)
         plt.close()
+
         logger.info(f"SHAP plot saved to {output_dir / 'shap_importance.png'}")
 
     return importance_df
 
 
-# ─── Model comparison table ──────────────────────────────────────────────────
+# ─── Model Comparison ────────────────────────────────────────────────────────
 
 def compare_models(
     results: dict[str, dict[str, float]],
 ) -> pd.DataFrame:
-    """
-    Build a comparison table from a dict of {model_name: metrics_dict}.
+    """Create sorted comparison table."""
 
-    Returns a DataFrame sorted by log_loss ascending.
-    """
     rows = []
     for name, metrics in results.items():
-        rows.append(
-            {
-                "model": name,
-                "accuracy": metrics.get("accuracy"),
-                "log_loss": metrics.get("log_loss"),
-                "brier_score": metrics.get("brier_score"),
-                "cv_accuracy": metrics.get("cv_accuracy_mean"),
-            }
-        )
-    return pd.DataFrame(rows).sort_values("log_loss").reset_index(drop=True)
+        rows.append({
+            "model": name,
+            "accuracy": metrics.get("accuracy"),
+            "log_loss": metrics.get("log_loss"),
+            "brier_score": metrics.get("brier_score"),
+            "cv_accuracy": metrics.get("cv_accuracy_mean"),
+        })
+
+    df = pd.DataFrame(rows)
+
+    return df.sort_values("log_loss").reset_index(drop=True)
