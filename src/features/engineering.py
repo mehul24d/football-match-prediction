@@ -1,7 +1,7 @@
 """
 src/features/engineering.py
 ----------------------------
-Feature engineering for football match prediction.
+Advanced feature engineering for football match prediction.
 """
 
 from __future__ import annotations
@@ -12,188 +12,202 @@ import pandas as pd
 from loguru import logger
 
 
-# ─── Elo Rating System ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Elo Rating System
+# ─────────────────────────────────────────────
 
 class EloRatingSystem:
-    def __init__(
-        self,
-        k_factor: float = 32,
-        initial_rating: float = 1500,
-        home_advantage: float = 100,
-    ) -> None:
-        self.k_factor = k_factor
-        self.initial_rating = initial_rating
-        self.home_advantage = home_advantage
-        self.ratings = defaultdict(lambda: initial_rating)
+    def __init__(self, k_factor=32, initial_rating=1500, home_advantage=100):
+        self.k = k_factor
+        self.initial = initial_rating
+        self.home_adv = home_advantage
+        self.ratings = defaultdict(lambda: self.initial)
 
-    def expected_score(self, rating_a: float, rating_b: float) -> float:
-        return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400.0))
+    def expected(self, ra, rb):
+        return 1 / (1 + 10 ** ((rb - ra) / 400))
 
-    def update(self, home_team: str, away_team: str, result: int):
-        r_home = self.ratings[home_team]
-        r_away = self.ratings[away_team]
+    def update(self, home, away, result):
+        ra = self.ratings[home]
+        rb = self.ratings[away]
 
-        e_home = self.expected_score(r_home + self.home_advantage, r_away)
-        e_away = 1.0 - e_home
+        exp_home = self.expected(ra + self.home_adv, rb)
 
         if result == 0:
-            s_home, s_away = 1.0, 0.0
+            s_home = 1
         elif result == 1:
-            s_home, s_away = 0.5, 0.5
+            s_home = 0.5
         else:
-            s_home, s_away = 0.0, 1.0
+            s_home = 0
 
-        # Store ratings BEFORE update (important)
-        r_home_before, r_away_before = r_home, r_away
+        r_home_before, r_away_before = ra, rb
 
-        self.ratings[home_team] += self.k_factor * (s_home - e_home)
-        self.ratings[away_team] += self.k_factor * (s_away - e_away)
+        self.ratings[home] += self.k * (s_home - exp_home)
+        self.ratings[away] += self.k * ((1 - s_home) - (1 - exp_home))
 
         return r_home_before, r_away_before
 
 
-# ─── Form Calculation (Unified History) ──────────────────────────────────────
+# ─────────────────────────────────────────────
+# Rolling helper (NO LEAKAGE)
+# ─────────────────────────────────────────────
 
-def _compute_form(df: pd.DataFrame, window: int):
-    team_history = defaultdict(list)
-
-    home_form = pd.Series(np.nan, index=df.index)
-    away_form = pd.Series(np.nan, index=df.index)
-
-    for idx, row in df.iterrows():
-        home_team = row["home_team"]
-        away_team = row["away_team"]
-        result = row["target"]
-
-        def get_form(team):
-            history = team_history[team][-window:]
-            if not history:
-                return np.nan
-            return np.mean(history)
-
-        home_form[idx] = get_form(home_team)
-        away_form[idx] = get_form(away_team)
-
-        # Update after computing form
-        home_pts = 3 if result == 0 else (1 if result == 1 else 0)
-        away_pts = 3 if result == 2 else (1 if result == 1 else 0)
-
-        team_history[home_team].append(home_pts)
-        team_history[away_team].append(away_pts)
-
-    return home_form, away_form
+def _rolling(df, group, col, window):
+    return (
+        df.groupby(group)[col]
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    )
 
 
-# ─── Time Decay Form ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Normal form
+# ─────────────────────────────────────────────
 
-def _decay(days, half_life):
+def _compute_form(df, window):
+    hist = defaultdict(list)
+    home_form, away_form = [], []
+
+    for _, row in df.iterrows():
+        h, a, r = row["home_team"], row["away_team"], row["target"]
+
+        hf = np.mean(hist[h][-window:]) if hist[h] else np.nan
+        af = np.mean(hist[a][-window:]) if hist[a] else np.nan
+
+        home_form.append(hf)
+        away_form.append(af)
+
+        hp = 3 if r == 0 else (1 if r == 1 else 0)
+        ap = 3 if r == 2 else (1 if r == 1 else 0)
+
+        hist[h].append(hp)
+        hist[a].append(ap)
+
+    return pd.Series(home_form), pd.Series(away_form)
+
+
+# ─────────────────────────────────────────────
+# 🔥 Decayed form (IMPORTANT)
+# ─────────────────────────────────────────────
+
+def _decay(days, half_life=30):
     return 2 ** (-days / half_life)
 
 
 def _compute_decayed_form(df, window=5, half_life=30):
     history = defaultdict(list)
 
-    home_form = pd.Series(np.nan, index=df.index)
-    away_form = pd.Series(np.nan, index=df.index)
+    home_form = []
+    away_form = []
 
-    for idx, row in df.iterrows():
-        home = row["home_team"]
-        away = row["away_team"]
-        result = row["target"]
-        date = row["date"]
+    for _, row in df.iterrows():
+        h, a, r, date = (
+            row["home_team"],
+            row["away_team"],
+            row["target"],
+            row["date"],
+        )
 
         def calc(team):
-            records = history[team][-window:]
-            if not records:
+            recs = history[team][-window:]
+            if not recs:
                 return np.nan
 
-            weights = [_decay((date - d).days, half_life) for d, _ in records]
-            pts = [p for _, p in records]
+            weights = [_decay((date - d).days, half_life) for d, _ in recs]
+            pts = [p for _, p in recs]
 
             return np.average(pts, weights=weights)
 
-        home_form[idx] = calc(home)
-        away_form[idx] = calc(away)
+        home_form.append(calc(h))
+        away_form.append(calc(a))
 
-        home_pts = 3 if result == 0 else (1 if result == 1 else 0)
-        away_pts = 3 if result == 2 else (1 if result == 1 else 0)
+        hp = 3 if r == 0 else (1 if r == 1 else 0)
+        ap = 3 if r == 2 else (1 if r == 1 else 0)
 
-        history[home].append((date, home_pts))
-        history[away].append((date, away_pts))
+        history[h].append((date, hp))
+        history[a].append((date, ap))
 
-    return home_form, away_form
-
-
-# ─── Rolling Stats (Unified) ─────────────────────────────────────────────────
-
-def _rolling_stats(df, stat_col, window):
-    result = pd.Series(np.nan, index=df.index)
-    history = defaultdict(list)
-
-    for idx, row in df.iterrows():
-        home = row["home_team"]
-        away = row["away_team"]
-
-        def avg(team):
-            values = history[team][-window:]
-            return np.mean(values) if values else np.nan
-
-        result[idx] = avg(home)
-
-        # Update BOTH teams properly
-        if stat_col in df.columns:
-            history[home].append(row[stat_col])
-            history[away].append(row[stat_col])
-
-    return result
+    return pd.Series(home_form), pd.Series(away_form)
 
 
-# ─── Main Feature Builder ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# MAIN FEATURE BUILDER
+# ─────────────────────────────────────────────
 
-def build_features(df: pd.DataFrame, form_window=5):
+def build_features(
+    df: pd.DataFrame,
+    form_window: int = 5,
+    elo_k_factor: float = 32,
+    elo_initial_rating: float = 1500,
+    elo_home_advantage: float = 100,
+):
     df = df.copy().sort_values("date").reset_index(drop=True)
 
-    logger.info("Building features...")
+    logger.info("Building ADVANCED features...")
 
-    # ── Elo ────────────────────────────────────────────────────────────────
-    elo = EloRatingSystem()
+    # ── Elo ───────────────────────────────────
+    elo = EloRatingSystem(
+        k_factor=elo_k_factor,
+        initial_rating=elo_initial_rating,
+        home_advantage=elo_home_advantage,
+    )
 
-    home_elos, away_elos = [], []
+    home_elo, away_elo = [], []
 
     for _, row in df.iterrows():
-        r_home, r_away = elo.update(
-            row["home_team"],
-            row["away_team"],
-            int(row["target"]),
-        )
-        home_elos.append(r_home)
-        away_elos.append(r_away)
+        h, a = elo.update(row["home_team"], row["away_team"], int(row["target"]))
+        home_elo.append(h)
+        away_elo.append(a)
 
-    df["home_elo"] = home_elos
-    df["away_elo"] = away_elos
+    df["home_elo"] = home_elo
+    df["away_elo"] = away_elo
     df["elo_diff"] = df["home_elo"] - df["away_elo"]
 
-    # ── Form ───────────────────────────────────────────────────────────────
-    home_form, away_form = _compute_form(df, form_window)
-    df["home_form"] = home_form
-    df["away_form"] = away_form
-    df["form_diff"] = df["home_form"] - df["away_form"]
+    # ── Form ─────────────────────────────────
+    hf, af = _compute_form(df, form_window)
+    df["home_form"] = hf
+    df["away_form"] = af
+    df["form_diff"] = hf - af
 
-    # ── Decayed Form ───────────────────────────────────────────────────────
-    home_d, away_d = _compute_decayed_form(df, form_window)
-    df["home_form_decayed"] = home_d
-    df["away_form_decayed"] = away_d
+    # ── 🔥 Decayed form (FIXED) ──────────────
+    hfd, afd = _compute_decayed_form(df, form_window)
+    df["home_form_decayed"] = hfd
+    df["away_form_decayed"] = afd
 
-    # ── Rest Days (NEW) ────────────────────────────────────────────────────
+    # ── Rolling stats ────────────────────────
+    df["home_goals_scored_avg"] = _rolling(df, "home_team", "home_goals", form_window)
+    df["home_goals_conceded_avg"] = _rolling(df, "home_team", "away_goals", form_window)
+
+    df["away_goals_scored_avg"] = _rolling(df, "away_team", "away_goals", form_window)
+    df["away_goals_conceded_avg"] = _rolling(df, "away_team", "home_goals", form_window)
+
+    df["home_shots_avg"] = _rolling(df, "home_team", "home_shots", form_window)
+    df["away_shots_avg"] = _rolling(df, "away_team", "away_shots", form_window)
+
+    df["home_shots_on_target_avg"] = _rolling(df, "home_team", "home_shots_on_target", form_window)
+    df["away_shots_on_target_avg"] = _rolling(df, "away_team", "away_shots_on_target", form_window)
+
+    df["home_corners_avg"] = _rolling(df, "home_team", "home_corners", form_window)
+    df["away_corners_avg"] = _rolling(df, "away_team", "away_corners", form_window)
+
+    # ── Rest days ───────────────────────────
     df["home_rest_days"] = df.groupby("home_team")["date"].diff().dt.days
     df["away_rest_days"] = df.groupby("away_team")["date"].diff().dt.days
 
-    # ── Interaction Features ───────────────────────────────────────────────
+    # ── Advanced features ───────────────────
+    df["home_goal_diff"] = df["home_goals_scored_avg"] - df["home_goals_conceded_avg"]
+    df["away_goal_diff"] = df["away_goals_scored_avg"] - df["away_goals_conceded_avg"]
+    df["goal_diff_diff"] = df["home_goal_diff"] - df["away_goal_diff"]
+
+    df["home_shot_eff"] = df["home_goals_scored_avg"] / (df["home_shots_on_target_avg"] + 1)
+    df["away_shot_eff"] = df["away_goals_scored_avg"] / (df["away_shots_on_target_avg"] + 1)
+
+    df["home_pressure"] = df["home_shots_avg"] + df["home_corners_avg"]
+    df["away_pressure"] = df["away_shots_avg"] + df["away_corners_avg"]
+
     df["elo_form_interaction"] = df["elo_diff"] * df["form_diff"]
 
-    # ── Fill missing safely ────────────────────────────────────────────────
-    df = df.fillna(method="ffill").fillna(0)
+    # ── Cleanup ─────────────────────────────
+    df = df.ffill().fillna(0)
 
-    logger.success(f"Features built: {df.shape[1]} columns")
+    logger.success(f"Advanced features built: {df.shape[1]} columns")
 
     return df

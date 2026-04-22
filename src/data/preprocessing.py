@@ -50,9 +50,6 @@ ODDS_COLS = ["odds_home", "odds_draw", "odds_away"]
 def clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     """
     Full preprocessing pipeline for raw football match data.
-
-    Returns:
-        Cleaned DataFrame ready for feature engineering.
     """
     df = df.copy()
     initial_rows = len(df)
@@ -84,12 +81,12 @@ def clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["home_team", "away_team", "result"])
     logger.info(f"Dropped {before_na - len(df)} rows due to missing teams/results")
 
-    # Fill numeric stats with median
+    # Fill numeric stats
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
-    # Drop rows where odds missing (important for modeling)
+    # Drop rows where odds missing
     df = df.dropna(subset=[c for c in ODDS_COLS if c in df.columns])
 
     # 7. Remove invalid scores
@@ -100,7 +97,10 @@ def clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     # 8. Encode target variable
     df = _encode_result(df)
 
-    # 9. Add useful safe features (NO LEAKAGE)
+    # 🔥 IMPORTANT FIX: ensure compatibility with training.py
+    df["result_label"] = df["target"]
+
+    # 9. Add safe features
     df["season"] = df["date"].dt.year
 
     df["match_id"] = (
@@ -111,7 +111,7 @@ def clean_matches(df: pd.DataFrame) -> pd.DataFrame:
         + df["away_team"]
     )
 
-    # 10. Normalize odds → probabilities (remove bookmaker margin)
+    # 10. Convert odds → probabilities
     df = _convert_odds_to_probabilities(df)
 
     # 11. Remove duplicates
@@ -119,7 +119,7 @@ def clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates()
     logger.info(f"Removed {before_dup - len(df)} duplicate rows")
 
-    # 12. Sort chronologically
+    # 12. Sort
     df = df.sort_values("date").reset_index(drop=True)
 
     logger.success(

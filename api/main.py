@@ -1,13 +1,13 @@
 """
 api/main.py
 -----------
-FastAPI application for football match outcome prediction.
+FastAPI application for football match outcome prediction (AUTO FEATURES).
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any, List
+from typing import List
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, status
@@ -17,40 +17,49 @@ from loguru import logger
 from api.schemas import (
     ErrorResponse,
     HealthResponse,
-    MatchFeaturesRequest,
     PredictionResponse,
 )
+
 from src.utils.helpers import load_config
 
 
-# ─── Lifespan (startup/shutdown) ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Lifespan (startup)
+# ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model at startup."""
+    """Load model + feature builder at startup."""
     try:
         config = load_config("configs/config.yaml")
+
         from src.models.predict import Predictor
+        from src.features.live_features import LiveFeatureBuilder
 
         app.state.config = config
         app.state.predictor = Predictor(config_path="configs/config.yaml")
+        app.state.feature_builder = LiveFeatureBuilder()
 
-        logger.success("Model loaded successfully.")
+        logger.success("Model + Feature Builder loaded successfully.")
+
     except Exception as exc:
-        logger.error(f"Failed to load model: {exc}")
+        logger.error(f"Startup failed: {exc}")
         app.state.predictor = None
+        app.state.feature_builder = None
 
     yield
 
     logger.info("Shutting down API.")
 
 
-# ─── App ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# App init
+# ─────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Football Match Prediction API",
-    version="1.0.0",
-    description="Predict football match outcomes using ML models",
+    version="2.0.0",
+    description="Fully automatic football match prediction API",
     lifespan=lifespan,
 )
 
@@ -63,47 +72,69 @@ app.add_middleware(
 )
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 
-def get_predictor(request: Request):
+def get_services(request: Request):
     predictor = request.app.state.predictor
-    if predictor is None:
+    feature_builder = request.app.state.feature_builder
+
+    if predictor is None or feature_builder is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model not loaded. Train model first.",
+            detail="Model or feature builder not loaded.",
         )
-    return predictor
+
+    return predictor, feature_builder
 
 
-# ─── Endpoints ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Request schema (SIMPLE INPUT)
+# ─────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class MatchRequest(BaseModel):
+    home_team: str
+    away_team: str
+
+
+# ─────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse, tags=["Utility"])
 async def health(request: Request):
-    """Check API + model status."""
     return HealthResponse(
         status="ok",
         model_loaded=request.app.state.predictor is not None,
-        version="1.0.0",
+        version="2.0.0",
     )
 
 
+# 🔥 SINGLE PREDICTION (AUTO)
 @app.post(
     "/predict",
     response_model=PredictionResponse,
     tags=["Prediction"],
     responses={503: {"model": ErrorResponse}},
 )
-async def predict(request_data: MatchFeaturesRequest, request: Request):
-    """Predict a single match outcome."""
-    predictor = get_predictor(request)
+async def predict(req: MatchRequest, request: Request):
+    predictor, feature_builder = get_services(request)
 
     try:
-        features = request_data.to_feature_dict()
+        # ✅ AUTO FEATURE BUILD
+        features = feature_builder.build_match_features(
+            req.home_team,
+            req.away_team
+        )
+
         result = predictor.predict(features)
 
         return PredictionResponse(
-            home_team=request_data.home_team,
-            away_team=request_data.away_team,
+            home_team=req.home_team,
+            away_team=req.away_team,
             home_win_prob=float(result["home_win_prob"]),
             draw_prob=float(result["draw_prob"]),
             away_win_prob=float(result["away_win_prob"]),
@@ -118,6 +149,7 @@ async def predict(request_data: MatchFeaturesRequest, request: Request):
         )
 
 
+# 🔥 BATCH PREDICTION (AUTO)
 @app.post(
     "/predict/batch",
     response_model=List[PredictionResponse],
@@ -125,31 +157,33 @@ async def predict(request_data: MatchFeaturesRequest, request: Request):
     responses={503: {"model": ErrorResponse}},
 )
 async def predict_batch(
-    request_list: List[MatchFeaturesRequest],
+    request_list: List[MatchRequest],
     request: Request,
 ):
-    """Predict multiple matches."""
     if not request_list:
         return []
 
-    predictor = get_predictor(request)
+    predictor, feature_builder = get_services(request)
 
     try:
-        records = [r.to_feature_dict() for r in request_list]
-        df = pd.DataFrame(records)
-
-        df_out = predictor.predict_batch(df)
-
         responses = []
-        for req, row in zip(request_list, df_out.to_dict(orient="records")):
+
+        for req in request_list:
+            features = feature_builder.build_match_features(
+                req.home_team,
+                req.away_team
+            )
+
+            result = predictor.predict(features)
+
             responses.append(
                 PredictionResponse(
                     home_team=req.home_team,
                     away_team=req.away_team,
-                    home_win_prob=float(row["home_win_prob"]),
-                    draw_prob=float(row["draw_prob"]),
-                    away_win_prob=float(row["away_win_prob"]),
-                    predicted_outcome=str(row["predicted_outcome"]),
+                    home_win_prob=float(result["home_win_prob"]),
+                    draw_prob=float(result["draw_prob"]),
+                    away_win_prob=float(result["away_win_prob"]),
+                    predicted_outcome=str(result["predicted_outcome"]),
                 )
             )
 
@@ -163,10 +197,11 @@ async def predict_batch(
         )
 
 
-# ─── Dev runner ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Dev runner
+# ─────────────────────────────────────────────────────────────
 
 def start() -> None:
-    """Run API via CLI."""
     import uvicorn
 
     cfg = load_config("configs/config.yaml")
