@@ -17,6 +17,7 @@ from loguru import logger
 from api.schemas import (
     ErrorResponse,
     HealthResponse,
+    MatchFeaturesRequest,
     PredictionResponse,
 )
 
@@ -120,7 +121,7 @@ async def health(request: Request):
     tags=["Prediction"],
     responses={503: {"model": ErrorResponse}},
 )
-async def predict(req: MatchRequest, request: Request):
+async def predict(req: MatchFeaturesRequest, request: Request):
     predictor, feature_builder = get_services(request)
 
     try:
@@ -157,7 +158,7 @@ async def predict(req: MatchRequest, request: Request):
     responses={503: {"model": ErrorResponse}},
 )
 async def predict_batch(
-    request_list: List[MatchRequest],
+    request_list: List[MatchFeaturesRequest],
     request: Request,
 ):
     if not request_list:

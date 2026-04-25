@@ -1,0 +1,123 @@
+# ─────────────────────────────────────────────────────────────
+# Model Architecture & Hyperparameter Configuration
+# ─────────────────────────────────────────────────────────────
+
+# ── Global ────────────────────────────────────────────────────
+global:
+  random_seed: 42
+  n_classes: 3                 # Home Win, Draw, Away Win
+  class_names: ["Home Win", "Draw", "Away Win"]
+
+# ── Data split ────────────────────────────────────────────────
+split:
+  test_size: 0.15
+  val_size: 0.10               # held-out for meta-learner training
+  temporal: true               # always use time-aware splitting
+
+# ── Level 0: Base Models ──────────────────────────────────────
+base_models:
+  random_forest:
+    enabled: true
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 5
+    min_samples_leaf: 2
+    n_jobs: -1
+    random_state: 42
+
+  xgboost:
+    enabled: true
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    eval_metric: mlogloss
+    random_state: 42
+    verbosity: 0
+
+  lightgbm:
+    enabled: true
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 6
+    num_leaves: 63
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+    verbosity: -1
+
+  neural_network:
+    enabled: true
+    hidden_layers: [128, 128, 64]
+    alpha: 0.0001              # L2 regularisation
+    learning_rate: 0.001
+    max_iter: 200
+    random_state: 42
+
+  bayesian_ridge:
+    enabled: true
+    alpha_1: 1.0e-6
+    alpha_2: 1.0e-6
+    lambda_1: 1.0e-6
+    lambda_2: 1.0e-6
+    max_iter: 300
+
+  logistic_regression:
+    enabled: true
+    C: 1.0
+    max_iter: 1000
+    solver: lbfgs
+    random_state: 42
+
+# ── Level 1: Meta-Learner ─────────────────────────────────────
+meta_learner:
+  type: logistic_regression
+  C: 0.5
+  max_iter: 1000
+  calibrate: true              # apply Platt calibration
+  calibration_method: sigmoid  # sigmoid or isotonic
+
+# ── Stacking Ensemble ─────────────────────────────────────────
+ensemble:
+  enabled: true
+  n_splits: 5                  # OOF cross-validation folds
+  expanding_window: true       # use expanding window for time-series CV
+
+# ── Sequential Model (LSTM) ───────────────────────────────────
+sequential:
+  enabled: false               # requires TensorFlow
+  sequence_length: 5
+  lstm_units: 64
+  dropout: 0.2
+  learning_rate: 0.001
+  epochs: 50
+  batch_size: 32
+  patience: 10                 # early stopping
+
+# ── Hyperparameter optimisation ───────────────────────────────
+optimization:
+  enabled: false               # requires optuna
+  n_trials: 50
+  timeout: 3600                # seconds
+  metric: log_loss             # minimise
+  cv_folds: 5
+
+# ── Calibration ───────────────────────────────────────────────
+calibration:
+  method: sigmoid              # sigmoid or isotonic
+  cv: 5
+
+# ── Persistence ───────────────────────────────────────────────
+persistence:
+  model_dir: models
+  best_model_filename: best_model.joblib
+  ensemble_filename: ensemble.joblib
+  scaler_filename: scaler.joblib
+  feature_cols_filename: feature_columns.txt
+
+# ── MLflow ────────────────────────────────────────────────────
+mlflow:
+  tracking_uri: mlruns
+  experiment_name: football-match-prediction-v2
+  log_artifacts: true

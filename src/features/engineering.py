@@ -26,6 +26,14 @@ class EloRatingSystem:
     def expected(self, ra, rb):
         return 1 / (1 + 10 ** ((rb - ra) / 400))
 
+    def expected_score(self, ra: float, rb: float) -> float:
+        """Alias for expected() for API clarity."""
+        return self.expected(ra, rb)
+
+    def get_rating(self, team: str) -> float:
+        """Return current Elo rating for a team."""
+        return self.ratings[team]
+
     def update(self, home, away, result):
         ra = self.ratings[home]
         rb = self.ratings[away]
@@ -58,16 +66,54 @@ def _rolling(df, group, col, window):
     )
 
 
+def _rolling_team_stats(
+    df: pd.DataFrame,
+    team_col: str,
+    stat_cols: list,
+    window: int,
+    prefix: str,
+) -> pd.DataFrame:
+    """
+    Compute rolling averages for each team with no lookahead leakage.
+
+    Parameters
+    ----------
+    df       : DataFrame sorted by date
+    team_col : column identifying the team (e.g. 'home_team')
+    stat_cols: list of numeric columns to average
+    window   : rolling window size
+    prefix   : prefix for output column names
+
+    Returns
+    -------
+    DataFrame with columns ``{prefix}_{col}_avg`` for each col in stat_cols.
+    """
+    result = pd.DataFrame(index=df.index)
+    for col in stat_cols:
+        series = df.groupby(team_col)[col].transform(
+            lambda x: x.shift(1).rolling(window, min_periods=1).mean()
+        )
+        result[f"{prefix}_{col}_avg"] = series
+    return result
+
+
 # ─────────────────────────────────────────────
 # Normal form
 # ─────────────────────────────────────────────
 
-def _compute_form(df, window):
+def _compute_form(df, window, target_col=None):
+    if target_col is None:
+        if "result_label" in df.columns:
+            target_col = "result_label"
+        elif "target" in df.columns:
+            target_col = "target"
+        else:
+            raise ValueError("DataFrame must contain 'result_label' or 'target' column.")
     hist = defaultdict(list)
     home_form, away_form = [], []
 
     for _, row in df.iterrows():
-        h, a, r = row["home_team"], row["away_team"], row["target"]
+        h, a, r = row["home_team"], row["away_team"], row[target_col]
 
         hf = np.mean(hist[h][-window:]) if hist[h] else np.nan
         af = np.mean(hist[a][-window:]) if hist[a] else np.nan
@@ -92,7 +138,14 @@ def _decay(days, half_life=30):
     return 2 ** (-days / half_life)
 
 
-def _compute_decayed_form(df, window=5, half_life=30):
+def _compute_decayed_form(df, window=5, half_life=30, target_col=None):
+    if target_col is None:
+        if "result_label" in df.columns:
+            target_col = "result_label"
+        elif "target" in df.columns:
+            target_col = "target"
+        else:
+            raise ValueError("DataFrame must contain 'result_label' or 'target' column.")
     history = defaultdict(list)
 
     home_form = []
@@ -102,7 +155,7 @@ def _compute_decayed_form(df, window=5, half_life=30):
         h, a, r, date = (
             row["home_team"],
             row["away_team"],
-            row["target"],
+            row[target_col],
             row["date"],
         )
 
@@ -143,6 +196,14 @@ def build_features(
 
     logger.info("Building ADVANCED features...")
 
+    # Auto-detect target column
+    if "result_label" in df.columns:
+        target_col = "result_label"
+    elif "target" in df.columns:
+        target_col = "target"
+    else:
+        raise ValueError("DataFrame must contain a 'result_label' or 'target' column")
+
     # ── Elo ───────────────────────────────────
     elo = EloRatingSystem(
         k_factor=elo_k_factor,
@@ -153,7 +214,7 @@ def build_features(
     home_elo, away_elo = [], []
 
     for _, row in df.iterrows():
-        h, a = elo.update(row["home_team"], row["away_team"], int(row["target"]))
+        h, a = elo.update(row["home_team"], row["away_team"], int(row[target_col]))
         home_elo.append(h)
         away_elo.append(a)
 
@@ -162,13 +223,13 @@ def build_features(
     df["elo_diff"] = df["home_elo"] - df["away_elo"]
 
     # ── Form ─────────────────────────────────
-    hf, af = _compute_form(df, form_window)
+    hf, af = _compute_form(df, form_window, target_col=target_col)
     df["home_form"] = hf
     df["away_form"] = af
     df["form_diff"] = hf - af
 
     # ── 🔥 Decayed form (FIXED) ──────────────
-    hfd, afd = _compute_decayed_form(df, form_window)
+    hfd, afd = _compute_decayed_form(df, form_window, target_col=target_col)
     df["home_form_decayed"] = hfd
     df["away_form_decayed"] = afd
 

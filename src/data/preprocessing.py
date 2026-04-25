@@ -97,10 +97,8 @@ def clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     # 8. Encode target variable
     df = _encode_result(df)
 
-    # 🔥 IMPORTANT FIX: ensure compatibility with training.py
-    df["result_label"] = df["target"]
-
     # 9. Add safe features
+    df["goal_diff"] = df["home_goals"] - df["away_goals"]
     df["season"] = df["date"].dt.year
 
     df["match_id"] = (
@@ -137,8 +135,8 @@ def _rename_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_team_names(df: pd.DataFrame) -> pd.DataFrame:
-    df["home_team"] = df["home_team"].str.strip().str.lower()
-    df["away_team"] = df["away_team"].str.strip().str.lower()
+    df["home_team"] = df["home_team"].str.strip()
+    df["away_team"] = df["away_team"].str.strip()
     return df
 
 
@@ -146,9 +144,10 @@ def _encode_result(df: pd.DataFrame) -> pd.DataFrame:
     label_map = {"H": 0, "D": 1, "A": 2}
     df = df.copy()
 
-    df["target"] = df["result"].map(label_map)
-    df = df.dropna(subset=["target"])
-    df["target"] = df["target"].astype(int)
+    df["result_label"] = df["result"].map(label_map)
+    df = df.dropna(subset=["result_label"])
+    df["result_label"] = df["result_label"].astype(int)
+    df["target"] = df["result_label"]  # backward-compat alias
 
     return df
 
