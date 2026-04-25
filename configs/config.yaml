@@ -1,11 +1,12 @@
 # ─────────────────────────────────────────────────────────────
-# Football Match Prediction – Central Configuration
+# Football Match Prediction – Central Configuration (v2)
 # ─────────────────────────────────────────────────────────────
 
 project:
   name: "football-match-prediction"
-  version: "0.1.0"
+  version: "2.0.0"
   random_seed: 42
+
 
 # ── Data ──────────────────────────────────────────────────────
 data:
@@ -13,7 +14,6 @@ data:
   processed_dir: "data/processed"
   external_dir: "data/external"
 
-  # Football-Data.co.uk league codes
   leagues:
     - name: "Premier League"
       code: "E0"
@@ -36,17 +36,27 @@ data:
     - "2022-23"
     - "2023-24"
 
-  # Football-Data.co.uk base URL template
   football_data_url: "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
+
 
 # ── Feature Engineering ───────────────────────────────────────
 features:
-  form_window: 5          # Last N matches for rolling form
-  elo_k_factor: 32        # Elo K-factor
+  form_window: 5
+  elo_k_factor: 32
   elo_initial_rating: 1500
-  elo_home_advantage: 100  # Home advantage in Elo points
-  time_decay_half_life: 30  # Days – exponential decay half-life
+  elo_home_advantage: 100
 
+  # NEW 🔥
+  time_decay_half_life: 30
+  ewma_alpha: 0.5
+
+  # Pressure system
+  pressure:
+    enabled: true
+    season_weeks: 38
+    default_value: 0.5
+
+  # Rolling stats
   rolling_stats:
     - "goals_scored"
     - "goals_conceded"
@@ -55,29 +65,17 @@ features:
     - "corners"
     - "fouls"
 
-  target_column: "result"   # H / D / A
-  feature_columns:
-    - "home_elo"
-    - "away_elo"
-    - "elo_diff"
-    - "home_form"
-    - "away_form"
-    - "home_goals_scored_avg"
-    - "home_goals_conceded_avg"
-    - "away_goals_scored_avg"
-    - "away_goals_conceded_avg"
-    - "home_shots_avg"
-    - "away_shots_avg"
-    - "home_shots_on_target_avg"
-    - "away_shots_on_target_avg"
-    - "home_corners_avg"
-    - "away_corners_avg"
+  target_column: "result"
+
 
 # ── Models ────────────────────────────────────────────────────
 models:
   output_dir: "models"
   test_size: 0.2
   cv_folds: 5
+
+  stacking:
+    n_splits: 5
 
   logistic_regression:
     C: 1.0
@@ -86,9 +84,7 @@ models:
 
   random_forest:
     n_estimators: 200
-    max_depth: 10
-    min_samples_split: 5
-    min_samples_leaf: 2
+    max_depth: 12
     n_jobs: -1
 
   xgboost:
@@ -97,7 +93,6 @@ models:
     max_depth: 6
     subsample: 0.8
     colsample_bytree: 0.8
-    use_label_encoder: false
     eval_metric: "mlogloss"
 
   lightgbm:
@@ -109,19 +104,34 @@ models:
     colsample_bytree: 0.8
     verbosity: -1
 
+
+# ── Calibration ───────────────────────────────────────────────
+calibration:
+  n_bins: 10
+  enabled: true
+
+
 # ── MLflow ────────────────────────────────────────────────────
 mlflow:
   tracking_uri: "mlruns"
   experiment_name: "football-match-prediction"
+
 
 # ── API ───────────────────────────────────────────────────────
 api:
   host: "0.0.0.0"
   port: 8000
   reload: true
-  model_path: "models/best_model.joblib"
+
+  model_path: "models/ensemble_model.joblib"
   scaler_path: "models/scaler.joblib"
-  label_encoder_path: "models/label_encoder.joblib"
+
+  # NEW 🔥 Live standings integration
+  standings:
+    enabled: true
+    api_url: "YOUR_STANDINGS_API_URL"
+    timeout: 5
+
 
 # ── Logging ───────────────────────────────────────────────────
 logging:

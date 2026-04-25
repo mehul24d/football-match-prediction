@@ -4,7 +4,6 @@ from src.features.engineering import (
     EloRatingSystem,
     build_features,
     _compute_form,
-    _rolling_team_stats,
 )
 from src.features.match_importance import MatchImportanceCalculator, add_pressure_features
 from src.features.advanced_features import (

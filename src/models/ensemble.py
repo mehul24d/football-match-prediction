@@ -1,202 +1,98 @@
 """
 src/models/ensemble.py
 -----------------------
-Stacking / blending ensemble implementations.
-
-Level-0 base models:
-  - Random Forest
-  - XGBoost
-  - LightGBM
-  - (Optionally) Neural Network / Bayesian Ridge
-
-Level-1 meta-learner:
-  - Logistic Regression trained on out-of-fold (OOF) predictions
-
-The ensemble produces calibrated probability estimates for
-{Home Win, Draw, Away Win}.
+Clean & efficient stacking ensemble (NO leakage, ROBUST).
 """
 
-from __future__ import annotations
-
-from typing import Any, Optional
-
 import numpy as np
-import pandas as pd
-from loguru import logger
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import RandomForestClassifier
+import copy
+
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 
-try:
-    from lightgbm import LGBMClassifier
-    _HAS_LGB = True
-except ImportError:
-    _HAS_LGB = False
-
-try:
-    from xgboost import XGBClassifier
-    _HAS_XGB = True
-except ImportError:
-    _HAS_XGB = False
-
-
-# ─── Default base-model factory ───────────────────────────────────────────────
-
-def _default_base_models() -> dict[str, Any]:
-    models: dict[str, Any] = {
-        "random_forest": RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            n_jobs=-1,
-            random_state=42,
-        ),
-        "logistic_regression_base": LogisticRegression(
-            max_iter=1000,
-            C=1.0,
-            random_state=42,
-        ),
-    }
-    if _HAS_XGB:
-        models["xgboost"] = XGBClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            eval_metric="mlogloss",
-            random_state=42,
-            verbosity=0,
-        )
-    if _HAS_LGB:
-        models["lightgbm"] = LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            num_leaves=63,
-            random_state=42,
-            verbosity=-1,
-        )
-    return models
-
-
-# ─── Stacking Ensemble ────────────────────────────────────────────────────────
 
 class StackingEnsemble:
-    """
-    Two-level stacking ensemble.
-
-    Parameters
-    ----------
-    base_models  : dict mapping name → unfitted sklearn estimator.
-                   If None, uses the default set (RF, XGB, LGB, LR).
-    meta_learner : Unfitted meta-learner estimator (default: LogisticRegression).
-    n_splits     : Number of CV folds for OOF generation.
-    calibrate    : If True, apply Platt calibration to the meta-learner output.
-    random_state : Random seed for reproducibility.
-    """
-
-    def __init__(
-        self,
-        base_models: Optional[dict[str, Any]] = None,
-        meta_learner: Optional[Any] = None,
-        n_splits: int = 5,
-        calibrate: bool = True,
-        random_state: int = 42,
-    ):
-        self.base_models = base_models or _default_base_models()
-        self.meta_learner = meta_learner or LogisticRegression(
-            max_iter=1000, C=1.0, random_state=random_state
-        )
+    def __init__(self, base_models, n_splits=5, random_state=42, calibrate=True):
+        self.base_models = base_models
+        self.meta_model = LogisticRegression(max_iter=1000)
         self.n_splits = n_splits
-        self.calibrate = calibrate
         self.random_state = random_state
+        self.calibrate = calibrate
 
-        self._fitted_base: dict[str, Any] = {}
-        self._fitted_meta: Any = None
-        self._n_classes: int = 3
+        self.fitted_base_models = []
+        self.fitted_meta_model = None
+        self.n_classes_ = None
 
-    # ── Fitting ───────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # Training (OOF stacking)
+    # ─────────────────────────────────────────────
+    def fit(self, X, y):
+        self.n_classes_ = len(np.unique(y))
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "StackingEnsemble":
-        """
-        Train the ensemble using k-fold OOF stacking.
-
-        Parameters
-        ----------
-        X : Feature matrix (n_samples, n_features) – already scaled.
-        y : Integer labels (0, 1, 2).
-        """
-        logger.info(
-            f"Training stacking ensemble with {len(self.base_models)} base models "
-            f"and {self.n_splits}-fold OOF."
+        kf = StratifiedKFold(
+            n_splits=self.n_splits,
+            shuffle=True,
+            random_state=self.random_state
         )
 
-        self._n_classes = len(np.unique(y))
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=self.random_state
+        meta_features = np.zeros(
+            (X.shape[0], len(self.base_models) * self.n_classes_)
         )
 
-        # OOF predictions matrix: (n_samples, n_base_models * n_classes)
-        oof_preds = np.zeros((len(X), len(self.base_models) * self._n_classes))
+        # Generate OOF predictions
+        for i, model in enumerate(self.base_models):
+            oof_preds = np.zeros((X.shape[0], self.n_classes_))
 
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-            logger.debug(f"Fold {fold_idx + 1}/{self.n_splits}")
-            X_tr, X_val = X[train_idx], X[val_idx]
-            y_tr = y[train_idx]
-
-            for m_idx, (name, model) in enumerate(self.base_models.items()):
-                import copy
+            for train_idx, val_idx in kf.split(X, y):
                 m = copy.deepcopy(model)
-                m.fit(X_tr, y_tr)
-                proba = m.predict_proba(X_val)
-                start = m_idx * self._n_classes
-                oof_preds[val_idx, start: start + self._n_classes] = proba
+                m.fit(X[train_idx], y[train_idx])
 
-        # Train meta-learner on full OOF
+                probs = m.predict_proba(X[val_idx])
+
+                # Handle class mismatch (VERY IMPORTANT)
+                aligned_probs = np.zeros((len(val_idx), self.n_classes_))
+                aligned_probs[:, :probs.shape[1]] = probs
+
+                oof_preds[val_idx] = aligned_probs
+
+            meta_features[:, i*self.n_classes_:(i+1)*self.n_classes_] = oof_preds
+
+            # Train final model on full data
+            final_model = copy.deepcopy(model)
+            final_model.fit(X, y)
+            self.fitted_base_models.append(final_model)
+
+        # ─────────────────────────────────────────
+        # Meta model (with optional calibration)
+        # ─────────────────────────────────────────
         if self.calibrate:
-            meta = CalibratedClassifierCV(self.meta_learner, cv=3, method="sigmoid")
+            meta = CalibratedClassifierCV(self.meta_model, cv=3, method="sigmoid")
         else:
-            meta = self.meta_learner
+            meta = self.meta_model
 
-        meta.fit(oof_preds, y)
-        self._fitted_meta = meta
+        meta.fit(meta_features, y)
+        self.fitted_meta_model = meta
 
-        # Refit base models on full training data
-        for name, model in self.base_models.items():
-            import copy
-            m = copy.deepcopy(model)
-            m.fit(X, y)
-            self._fitted_base[name] = m
-            logger.info(f"  Base model '{name}' trained.")
+    # ─────────────────────────────────────────────
+    # Prediction
+    # ─────────────────────────────────────────────
+    def predict_proba(self, X):
+        if not self.fitted_base_models:
+            raise RuntimeError("Model not fitted. Call fit() first.")
 
-        train_meta_input = self._base_predict_proba(X)
-        train_log_loss = log_loss(y, meta.predict_proba(train_meta_input))
-        logger.success(f"Ensemble training complete. Train log-loss: {train_log_loss:.4f}")
+        meta_features = []
 
-        return self
+        for model in self.fitted_base_models:
+            probs = model.predict_proba(X)
 
-    # ── Prediction ────────────────────────────────────────────────────────────
+            aligned_probs = np.zeros((X.shape[0], self.n_classes_))
+            aligned_probs[:, :probs.shape[1]] = probs
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return calibrated probability estimates (n_samples, n_classes)."""
-        if not self._fitted_base:
-            raise RuntimeError("Ensemble has not been fitted yet. Call .fit() first.")
-        meta_input = self._base_predict_proba(X)
-        return self._fitted_meta.predict_proba(meta_input)
+            meta_features.append(aligned_probs)
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Return class predictions (argmax of probabilities)."""
+        meta_X = np.hstack(meta_features)
+        return self.fitted_meta_model.predict_proba(meta_X)
+
+    def predict(self, X):
         return np.argmax(self.predict_proba(X), axis=1)
-
-    def _base_predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Concatenate base-model probability outputs for meta-learner input."""
-        parts = []
-        for name, model in self._fitted_base.items():
-            parts.append(model.predict_proba(X))
-        return np.hstack(parts)
-
-    # ── Convenience ───────────────────────────────────────────────────────────
-
-    def base_model_names(self) -> list[str]:
-        return list(self.base_models.keys())

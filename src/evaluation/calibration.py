@@ -1,12 +1,13 @@
 """
 src/evaluation/calibration.py
-------------------------------
-Calibration metrics and reliability diagrams.
+--------------------------------
+Calibration metrics + diagnostics (PRODUCTION SAFE).
 
-Provides:
-  - Multiclass Brier Score
-  - Expected Calibration Error (ECE)
-  - Reliability diagram data for plotting
+✔ Multiclass Brier Score
+✔ Expected Calibration Error (ECE)
+✔ Reliability diagram data
+✔ Full calibration report
+✔ Robust against bad probabilities
 """
 
 from __future__ import annotations
@@ -16,33 +17,44 @@ import pandas as pd
 from loguru import logger
 
 
-# ─── Brier Score ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# INTERNAL: SAFE PROBABILITY HANDLING
+# ─────────────────────────────────────────────
+def _sanitize_probs(y_prob: np.ndarray) -> np.ndarray:
+    """Ensure probabilities are valid (0–1 and sum to 1)."""
+    y_prob = np.asarray(y_prob, dtype=float)
 
-def brier_score_multiclass(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-) -> float:
+    # Clip to [0,1]
+    y_prob = np.clip(y_prob, 1e-12, 1.0)
+
+    # Normalize rows
+    row_sums = y_prob.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+
+    return y_prob / row_sums
+
+
+# ─────────────────────────────────────────────
+# BRIER SCORE
+# ─────────────────────────────────────────────
+def brier_score_multiclass(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     """
-    Multiclass Brier score: mean of squared probability errors.
+    Multiclass Brier Score.
 
-    Perfect predictions → 0.0.  Random (1/3 each) → ≈ 0.667.
-
-    Parameters
-    ----------
-    y_true : (n_samples,) integer class labels.
-    y_prob : (n_samples, n_classes) probability matrix.
-
-    Returns
-    -------
-    Scalar Brier score.
+    Lower is better.
     """
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = _sanitize_probs(y_prob)
+
     n_classes = y_prob.shape[1]
-    y_onehot = np.eye(n_classes)[np.asarray(y_true, dtype=int)]
+    y_onehot = np.eye(n_classes)[y_true]
+
     return float(np.mean(np.sum((y_prob - y_onehot) ** 2, axis=1)))
 
 
-# ─── Expected Calibration Error ──────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+# ECE (FIXED BINNING)
+# ─────────────────────────────────────────────
 def expected_calibration_error(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -50,42 +62,31 @@ def expected_calibration_error(
     class_idx: int = 0,
 ) -> float:
     """
-    Expected Calibration Error (ECE) for a single class.
-
-    Measures the average gap between predicted probability and observed
-    frequency across equal-width confidence bins.
-
-    Parameters
-    ----------
-    y_true    : (n_samples,) integer class labels.
-    y_prob    : (n_samples, n_classes) probability matrix.
-    n_bins    : Number of equal-width bins.
-    class_idx : Which class to evaluate (0=Home Win, 1=Draw, 2=Away Win).
-
-    Returns
-    -------
-    ECE as a float in [0, 1].
+    Expected Calibration Error (ECE) for ONE class.
     """
+    y_prob = _sanitize_probs(y_prob)
+
     probs = y_prob[:, class_idx]
     labels = (y_true == class_idx).astype(int)
 
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+
+    # FIX: ensure values in last bin
+    bin_ids = np.digitize(probs, bins, right=True) - 1
+    bin_ids = np.clip(bin_ids, 0, n_bins - 1)
+
     ece = 0.0
     n = len(probs)
 
-    for i in range(n_bins):
-        lo, hi = bin_edges[i], bin_edges[i + 1]
-        mask = (probs >= lo) & (probs < hi)
-        if i == n_bins - 1:
-            mask = (probs >= lo) & (probs <= hi)
-
-        bin_size = mask.sum()
-        if bin_size == 0:
+    for b in range(n_bins):
+        mask = bin_ids == b
+        if not np.any(mask):
             continue
 
-        avg_conf = probs[mask].mean()
-        avg_acc = labels[mask].mean()
-        ece += (bin_size / n) * abs(avg_conf - avg_acc)
+        conf = probs[mask].mean()
+        acc = labels[mask].mean()
+
+        ece += (mask.sum() / n) * abs(conf - acc)
 
     return float(ece)
 
@@ -96,21 +97,21 @@ def mean_ece(
     n_bins: int = 10,
 ) -> float:
     """
-    Mean ECE across all classes.
-
-    Returns the average Expected Calibration Error over all output classes.
+    Average ECE across all classes.
     """
+    y_prob = _sanitize_probs(y_prob)
+
     n_classes = y_prob.shape[1]
-    return float(
-        np.mean([
-            expected_calibration_error(y_true, y_prob, n_bins=n_bins, class_idx=c)
-            for c in range(n_classes)
-        ])
-    )
+
+    return float(np.mean([
+        expected_calibration_error(y_true, y_prob, n_bins, c)
+        for c in range(n_classes)
+    ]))
 
 
-# ─── Reliability diagram data ─────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+# RELIABILITY DIAGRAM DATA
+# ─────────────────────────────────────────────
 def reliability_diagram_data(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -118,51 +119,44 @@ def reliability_diagram_data(
     class_idx: int = 0,
 ) -> pd.DataFrame:
     """
-    Compute data for a reliability (calibration) diagram.
-
-    Parameters
-    ----------
-    y_true    : Integer class labels.
-    y_prob    : Probability matrix.
-    n_bins    : Number of bins.
-    class_idx : Class to evaluate.
-
-    Returns
-    -------
-    DataFrame with columns: ['bin_centre', 'avg_confidence', 'fraction_positive',
-                              'count', 'gap']
+    Data for reliability diagrams.
     """
+    y_prob = _sanitize_probs(y_prob)
+
     probs = y_prob[:, class_idx]
     labels = (y_true == class_idx).astype(int)
 
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
     rows = []
 
     for i in range(n_bins):
-        lo, hi = bin_edges[i], bin_edges[i + 1]
-        mask = (probs >= lo) & (probs < hi)
+        lo, hi = bins[i], bins[i + 1]
+
         if i == n_bins - 1:
             mask = (probs >= lo) & (probs <= hi)
+        else:
+            mask = (probs >= lo) & (probs < hi)
 
-        bin_size = int(mask.sum())
-        if bin_size == 0:
+        if not np.any(mask):
             continue
 
         avg_conf = float(probs[mask].mean())
         frac_pos = float(labels[mask].mean())
+
         rows.append({
             "bin_centre": (lo + hi) / 2,
             "avg_confidence": avg_conf,
             "fraction_positive": frac_pos,
-            "count": bin_size,
+            "count": int(mask.sum()),
             "gap": avg_conf - frac_pos,
         })
 
     return pd.DataFrame(rows)
 
 
-# ─── Summary calibration report ──────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+# FULL CALIBRATION REPORT
+# ─────────────────────────────────────────────
 def calibration_report(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -170,32 +164,35 @@ def calibration_report(
     n_bins: int = 10,
 ) -> dict:
     """
-    Compute a full calibration report: Brier score, ECE per class, mean ECE.
+    Full calibration diagnostics.
 
-    Parameters
-    ----------
-    y_true       : Integer class labels.
-    y_prob       : Probability matrix.
-    class_names  : Optional names for each class.
-    n_bins       : Calibration bins.
-
-    Returns
-    -------
-    Dict with 'brier_score', 'mean_ece', and per-class 'ece_{class}' values.
+    Returns:
+      - Brier score
+      - Mean ECE
+      - Per-class ECE
     """
-    class_names = class_names or [f"class_{i}" for i in range(y_prob.shape[1])]
+    y_true = np.asarray(y_true)
+    y_prob = _sanitize_probs(y_prob)
+
     n_classes = y_prob.shape[1]
 
-    report: dict = {
+    if class_names is None:
+        class_names = [f"class_{i}" for i in range(n_classes)]
+
+    report = {
         "brier_score": brier_score_multiclass(y_true, y_prob),
-        "mean_ece": mean_ece(y_true, y_prob, n_bins=n_bins),
+        "mean_ece": mean_ece(y_true, y_prob, n_bins),
     }
-    for c in range(n_classes):
-        ece = expected_calibration_error(y_true, y_prob, n_bins=n_bins, class_idx=c)
-        report[f"ece_{class_names[c]}"] = ece
+
+    for i in range(n_classes):
+        report[f"ece_{class_names[i]}"] = expected_calibration_error(
+            y_true, y_prob, n_bins, i
+        )
 
     logger.info(
-        f"Calibration – Brier: {report['brier_score']:.4f}  "
+        f"📊 Calibration → "
+        f"Brier: {report['brier_score']:.4f}, "
         f"Mean ECE: {report['mean_ece']:.4f}"
     )
+
     return report

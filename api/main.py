@@ -1,7 +1,7 @@
 """
 api/main.py
 -----------
-FastAPI application for football match outcome prediction (AUTO FEATURES).
+FastAPI application for football match outcome prediction (AUTO FEATURES + PRESSURE INDEX).
 """
 
 from __future__ import annotations
@@ -59,8 +59,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Football Match Prediction API",
-    version="2.0.0",
-    description="Fully automatic football match prediction API",
+    version="3.0.0",
+    description="Football prediction API with live pressure index",
     lifespan=lifespan,
 )
 
@@ -91,7 +91,7 @@ def get_services(request: Request):
 
 
 # ─────────────────────────────────────────────────────────────
-# Request schema (SIMPLE INPUT)
+# Request schema (OPTIONAL WEEK SUPPORT)
 # ─────────────────────────────────────────────────────────────
 
 from pydantic import BaseModel
@@ -99,6 +99,28 @@ from pydantic import BaseModel
 class MatchRequest(BaseModel):
     home_team: str
     away_team: str
+    week: int | None = None  # ✅ optional real week
+
+
+# ─────────────────────────────────────────────────────────────
+# Helper: Resolve current week
+# ─────────────────────────────────────────────────────────────
+
+def resolve_current_week(req, standings_df):
+    # 1. From API request
+    if hasattr(req, "week") and req.week is not None:
+        week = int(req.week)
+
+    # 2. From standings
+    elif "matches_played" in standings_df.columns:
+        week = int(standings_df["matches_played"].max())
+
+    # 3. Fallback
+    else:
+        week = 30
+
+    # Clamp safely
+    return max(1, min(38, week))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -110,11 +132,11 @@ async def health(request: Request):
     return HealthResponse(
         status="ok",
         model_loaded=request.app.state.predictor is not None,
-        version="2.0.0",
+        version="3.0.0",
     )
 
 
-# 🔥 SINGLE PREDICTION (AUTO)
+# 🔥 SINGLE PREDICTION
 @app.post(
     "/predict",
     response_model=PredictionResponse,
@@ -125,12 +147,44 @@ async def predict(req: MatchFeaturesRequest, request: Request):
     predictor, feature_builder = get_services(request)
 
     try:
-        # ✅ AUTO FEATURE BUILD
+        # ─────────────────────────────────────────
+        # 1. Base Features
+        # ─────────────────────────────────────────
         features = feature_builder.build_match_features(
             req.home_team,
             req.away_team
         )
 
+        # ─────────────────────────────────────────
+        # 2. Pressure Index (LIVE)
+        # ─────────────────────────────────────────
+        try:
+            from src.data.live_standings import LiveStandings
+            from src.features.match_importance import MatchImportanceCalculator
+
+            standings_df = LiveStandings().get_standings()
+
+            current_week = resolve_current_week(req, standings_df)
+
+            calc = MatchImportanceCalculator(standings_df)
+
+            pressure_home, pressure_away = calc.calculate(
+                req.home_team,
+                req.away_team,
+                current_week=current_week
+            )
+
+        except Exception as e:
+            logger.warning(f"Pressure index failed: {e}")
+            pressure_home, pressure_away = 0.5, 0.5
+
+        # Add to features
+        features["pressure_index_home"] = pressure_home
+        features["pressure_index_away"] = pressure_away
+
+        # ─────────────────────────────────────────
+        # 3. Prediction
+        # ─────────────────────────────────────────
         result = predictor.predict(features)
 
         return PredictionResponse(
@@ -140,6 +194,10 @@ async def predict(req: MatchFeaturesRequest, request: Request):
             draw_prob=float(result["draw_prob"]),
             away_win_prob=float(result["away_win_prob"]),
             predicted_outcome=str(result["predicted_outcome"]),
+
+            # 🔥 NEW OUTPUT
+            pressure_index_home=float(pressure_home),
+            pressure_index_away=float(pressure_away),
         )
 
     except Exception as exc:
@@ -150,7 +208,7 @@ async def predict(req: MatchFeaturesRequest, request: Request):
         )
 
 
-# 🔥 BATCH PREDICTION (AUTO)
+# 🔥 BATCH PREDICTION
 @app.post(
     "/predict/batch",
     response_model=List[PredictionResponse],
@@ -167,6 +225,12 @@ async def predict_batch(
     predictor, feature_builder = get_services(request)
 
     try:
+        from src.data.live_standings import LiveStandings
+        from src.features.match_importance import MatchImportanceCalculator
+
+        standings_df = LiveStandings().get_standings()
+        calc = MatchImportanceCalculator(standings_df)
+
         responses = []
 
         for req in request_list:
@@ -174,6 +238,20 @@ async def predict_batch(
                 req.home_team,
                 req.away_team
             )
+
+            current_week = resolve_current_week(req, standings_df)
+
+            try:
+                pressure_home, pressure_away = calc.calculate(
+                    req.home_team,
+                    req.away_team,
+                    current_week=current_week
+                )
+            except:
+                pressure_home, pressure_away = 0.5, 0.5
+
+            features["pressure_index_home"] = pressure_home
+            features["pressure_index_away"] = pressure_away
 
             result = predictor.predict(features)
 
@@ -185,6 +263,8 @@ async def predict_batch(
                     draw_prob=float(result["draw_prob"]),
                     away_win_prob=float(result["away_win_prob"]),
                     predicted_outcome=str(result["predicted_outcome"]),
+                    pressure_index_home=float(pressure_home),
+                    pressure_index_away=float(pressure_away),
                 )
             )
 
