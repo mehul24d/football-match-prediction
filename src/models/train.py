@@ -53,6 +53,17 @@ FEATURE_COLS = [
 
 
 # ─────────────────────────────────────────────
+# Brier Score
+# ─────────────────────────────────────────────
+
+def brier_score_multiclass(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Multiclass Brier score (mean squared error over one-hot probabilities)."""
+    n_classes = y_prob.shape[1]
+    y_onehot = np.eye(n_classes)[np.asarray(y_true, dtype=int)]
+    return float(np.mean(np.sum((y_prob - y_onehot) ** 2, axis=1)))
+
+
+# ─────────────────────────────────────────────
 # Models + Hyperparameter Search Space
 # ─────────────────────────────────────────────
 def get_models():
@@ -94,27 +105,69 @@ def get_models():
 # ─────────────────────────────────────────────
 # Data Preparation (TIME SAFE)
 # ─────────────────────────────────────────────
-def prepare_data(df: pd.DataFrame, test_size: float):
-    df = df.sort_values("date").reset_index(drop=True)
+def prepare_data(
+    df: pd.DataFrame,
+    test_size: float = 0.2,
+    random_seed: int | None = None,
+    feature_cols: list[str] | None = None,
+):
+    """
+    Prepare train/test splits with scaling.
 
-    df = df[FEATURE_COLS + ["target"]].dropna()
+    Parameters
+    ----------
+    df           : DataFrame with features and a result_label/target column.
+    test_size    : Fraction of data for the test set (temporal split).
+    random_seed  : Optional random seed (used for reproducibility).
+    feature_cols : Explicit list of feature columns to use.
+                   If None, uses FEATURE_COLS filtered to those present in df.
+                   Raises ValueError if any explicitly requested column is missing.
+
+    Returns
+    -------
+    X_train, X_test, y_train, y_test, scaler, feat_cols
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    # Detect target column
+    if "result_label" in df.columns:
+        target_col = "result_label"
+    elif "target" in df.columns:
+        target_col = "target"
+    else:
+        raise ValueError("DataFrame must contain 'result_label' or 'target' column.")
+
+    # Resolve feature columns
+    if feature_cols is None:
+        feat_cols = [c for c in FEATURE_COLS if c in df.columns]
+    else:
+        missing = [c for c in feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Feature columns not found in DataFrame: {missing}")
+        feat_cols = list(feature_cols)
+
+    if "date" in df.columns:
+        df = df.sort_values("date").reset_index(drop=True)
+
+    df = df[feat_cols + [target_col]].dropna()
 
     split = int(len(df) * (1 - test_size))
 
     train_df = df.iloc[:split]
     test_df = df.iloc[split:]
 
-    X_train = train_df[FEATURE_COLS]
-    y_train = train_df["target"]
+    X_train_raw = train_df[feat_cols].values
+    y_train = train_df[target_col].astype(np.int64).values
 
-    X_test = test_df[FEATURE_COLS]
-    y_test = test_df["target"]
+    X_test_raw = test_df[feat_cols].values
+    y_test = test_df[target_col].astype(np.int64).values
 
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_train = scaler.fit_transform(X_train_raw)
+    X_test = scaler.transform(X_test_raw)
 
-    return X_train, X_test, X_train_scaled, X_test_scaled, y_train, y_test, scaler
+    return X_train, X_test, y_train, y_test, scaler, feat_cols
 
 
 # ─────────────────────────────────────────────
@@ -176,9 +229,9 @@ def main(config_path="configs/config.yaml"):
     mlflow.set_tracking_uri(cfg["mlflow"]["tracking_uri"])
     mlflow.set_experiment(cfg["mlflow"]["experiment_name"])
 
-    X_train, X_test, X_train_scaled, X_test_scaled, y_train, y_test, scaler = prepare_data(
+    X_train, X_test, y_train, y_test, scaler, feat_cols = prepare_data(
         df,
-        cfg["models"]["test_size"],
+        test_size=cfg["models"]["test_size"],
     )
 
     models = get_models()
@@ -186,18 +239,11 @@ def main(config_path="configs/config.yaml"):
 
     for name, (model, params) in models.items():
         with mlflow.start_run(run_name=name):
-            if name == "logistic_regression":
-                X_tr = X_train_scaled
-                X_te = X_test_scaled
-            else:
-                X_tr = X_train
-                X_te = X_test
-
             trained_model, best_params = train_model(
-                name, model, params, X_tr, y_train
+                name, model, params, X_train, y_train
             )
 
-            metrics = evaluate(trained_model, X_te, y_test)
+            metrics = evaluate(trained_model, X_test, y_test)
 
             mlflow.log_params(best_params)
             mlflow.log_metrics(metrics)
@@ -223,7 +269,7 @@ def main(config_path="configs/config.yaml"):
 
     # Save feature columns
     with open(models_dir / "feature_columns.txt", "w") as f:
-        for col in FEATURE_COLS:
+        for col in feat_cols:
             f.write(col + "\n")
 
     logger.success("Model + scaler + features saved.")
