@@ -10,6 +10,7 @@ odds_home
 odds_draw
 odds_away
 season
+week
 home_elo
 away_elo
 elo_diff

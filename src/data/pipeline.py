@@ -1,204 +1,263 @@
 """
 src/data/pipeline.py
---------------------
-FULL v2 Pipeline:
-download → preprocess → base → pressure (LIVE) → advanced → temporal → validation → save
-"""
+---------------------
+Complete data preprocessing pipeline:
+1. Load raw CSV files
+2. Preprocess match data
+3. Build rolling standings (matchday tables)
+4. Save processed outputs
 
-from __future__ import annotations
+Usage:
+    from src.data.pipeline import run_pipeline
+    all_standings = run_pipeline(config_path="configs/config.yaml")
+    
+    Or from command line:
+    python -m src.data.pipeline
+"""
 
 from pathlib import Path
-
 from loguru import logger
+import pandas as pd
 
-from src.data.ingestion import download_all, load_all_raw
-from src.data.preprocessing import clean_matches, save_processed
-
-from src.features.engineering import build_features
-from src.features.match_importance import add_pressure_features
-from src.features.advanced_features import add_advanced_features
-from src.features.temporal_features import add_temporal_features
-
-# ✅ NEW (LIVE STANDINGS API)
-from src.data.live_standings import LiveStandings
-
-from src.utils.helpers import load_config, ensure_dir, set_seed, setup_logging
+from src.data.preprocessing import preprocess_raw_csv, load_processed
+from src.features.rolling_standings import build_rolling_standings_country_season
+from src.utils.helpers import load_config, ensure_dir
 
 
-# ─────────────────────────────────────────────
-# Validation helper
-# ─────────────────────────────────────────────
-
-def _validate_features(df):
-    required = [
-        # Base
-        "home_elo", "away_elo", "elo_diff",
-        "home_form", "away_form", "form_diff",
-
-        # Rolling stats
-        "home_goals_scored_avg", "away_goals_scored_avg",
-        "home_shots_avg", "away_shots_avg",
-
-        # Interaction
-        "elo_form_interaction",
-
-        # Advanced
-        "home_attack_vs_def",
-        "away_attack_vs_def",
-        "tempo_diff",
-        "control_diff",
-
-        # Temporal
-        "home_form_lag_1",
-        "away_form_lag_1",
-
-        # Pressure
-        "pressure_index_home",
-        "pressure_index_away",
-    ]
-
-    missing = [c for c in required if c not in df.columns]
-
-    if missing:
-        raise ValueError(f"❌ Missing engineered features: {missing}")
-
-    logger.success("✅ Feature validation passed")
-
-
-# ─────────────────────────────────────────────
-# Main pipeline
-# ─────────────────────────────────────────────
-
-def run_pipeline(
-    config_path: str | Path = "configs/config.yaml",
-    download: bool = True,
-    overwrite_download: bool = False,
-) -> None:
-    cfg = load_config(config_path)
-
-    setup_logging(
-        log_level=cfg.get("logging", {}).get("level", "INFO"),
-        log_dir=cfg.get("logging", {}).get("log_dir"),
-    )
-
-    set_seed(cfg["project"]["random_seed"])
-
-    raw_dir = Path(cfg["data"]["raw_dir"])
-    processed_dir = Path(cfg["data"]["processed_dir"])
-
-    ensure_dir(raw_dir)
-    ensure_dir(processed_dir)
-
-    clean_path = processed_dir / "matches_clean.csv"
-    feature_path = processed_dir / "matches_features.csv"
-
-    # ─────────────────────────────────────────
-    # Step 1: Download
-    # ─────────────────────────────────────────
-    if download:
-        logger.info("=== Step 1/5: Downloading raw data ===")
+def preprocess_and_build_standings(
+    raw_data_dir: Path,
+    processed_data_dir: Path,
+    standings_data_dir: Path,
+    overwrite: bool = False,
+) -> dict[str, dict[str, dict[int, pd.DataFrame]]]:
+    """
+    Complete pipeline:
+    1. Load raw CSV files
+    2. Preprocess match data → matches_{country}_{season}.csv
+    3. Build rolling standings → standings_{country}_{season}.csv
+    4. Save individual matchday tables
+    
+    Parameters:
+    -----------
+    raw_data_dir : Path
+        Directory with raw CSV files (E0_2022_23.csv, etc.)
+    processed_data_dir : Path
+        Directory to save processed matches
+    standings_data_dir : Path
+        Directory to save matchday standings tables
+    overwrite : bool
+        If True, reprocess even if files exist
+        
+    Returns:
+    --------
+    all_standings : dict[str, dict[str, dict[int, pd.DataFrame]]]
+        {country: {season: {matchday: standings_df}}}
+    """
+    
+    raw_data_dir = Path(raw_data_dir)
+    processed_data_dir = Path(processed_data_dir)
+    standings_data_dir = Path(standings_data_dir)
+    
+    # Create output directories
+    ensure_dir(processed_data_dir)
+    ensure_dir(standings_data_dir)
+    
+    # Find all raw CSV files
+    csv_files = sorted(raw_data_dir.glob("*.csv"))
+    
+    if not csv_files:
+        logger.error(f"❌ No CSV files found in {raw_data_dir}")
+        return {}
+    
+    logger.info(f"Found {len(csv_files)} raw CSV files\n")
+    all_standings = {}
+    
+    for csv_file in csv_files:
+        stem = csv_file.stem
+        parts = stem.split("_")
+        
+        if len(parts) < 3:
+            logger.warning(f"⏭️  Skipping {stem} - invalid format (expected: COUNTRY_YEAR_YEAR)")
+            continue
+        
+        # Extract country and season
+        file_country = "_".join(parts[:-2])  # E0, D1, SP1, F1
+        file_season = "_".join(parts[-2:])   # 2022_23
+        
+        logger.info(f"{'='*100}")
+        logger.info(f"Processing: {stem}")
+        logger.info(f"{'='*100}")
+        
         try:
-            download_all(config_path=config_path, overwrite=overwrite_download)
-        except Exception as exc:
-            logger.warning(f"Download failed → using cached data: {exc}")
-    else:
-        logger.info("=== Step 1/5: Skipped download ===")
+            # ─── STEP 1: Load raw data ───────────────────────────────────────
+            logger.info(f"1️⃣  Loading raw data from {csv_file.name}...")
+            df_raw = pd.read_csv(csv_file)
+            logger.info(f"   ✅ Loaded {len(df_raw)} matches")
+            
+            # ─── STEP 2: Preprocess matches ───────────────────────────────────
+            logger.info(f"2️⃣  Preprocessing match data...")
+            df_processed = preprocess_raw_csv(df_raw)
+            logger.info(f"   ✅ Preprocessed to {len(df_processed)} matches")
+            
+            # Save processed matches
+            processed_file = processed_data_dir / f"matches_{file_country}_{file_season}.csv"
+            df_processed.to_csv(processed_file, index=False)
+            logger.info(f"   💾 Saved to {processed_file.name}\n")
+            
+            # ─── STEP 3: Build rolling standings ──────────────────────────────
+            logger.info(f"3️⃣  Building rolling standings...")
+            standings = build_rolling_standings_country_season(
+                df_processed,
+                country=file_country,
+                season=file_season,
+                verbose=True,
+                print_every_matchday=False,
+            )
+            
+            if not standings:
+                logger.warning(f"⚠️  No standings generated for {stem}\n")
+                continue
+            
+            # ─── STEP 4: Save standings for each matchday ─────────────────────
+            logger.info(f"4️⃣  Saving matchday standings...")
+            
+            # Create country/season subdirectory
+            standings_subdir = standings_data_dir / file_country / file_season
+            ensure_dir(standings_subdir)
+            
+            # Save each matchday as separate CSV
+            for matchday, standings_df in standings.items():
+                standings_file = standings_subdir / f"matchday_{matchday:02d}.csv"
+                standings_df.to_csv(standings_file, index=False)
+            
+            logger.info(f"   ✅ Saved {len(standings)} matchday tables")
+            logger.info(f"   📁 Location: {standings_subdir}\n")
+            
+            # ─── STEP 5: Save combined standings CSV ──────────────────────────
+            logger.info(f"5️⃣  Creating combined standings file...")
+            
+            # Flatten standings: each row = one team at one matchday
+            combined_rows = []
+            for matchday, standings_df in standings.items():
+                temp_df = standings_df.copy()
+                temp_df['matchday'] = matchday
+                temp_df['country'] = file_country
+                temp_df['season'] = file_season
+                combined_rows.append(temp_df)
+            
+            if combined_rows:
+                combined_standings_df = pd.concat(combined_rows, ignore_index=True)
+                
+                # Reorder columns
+                cols = [
+                    'country', 'season', 'matchday', 'position', 'team',
+                    'played', 'won', 'drawn', 'lost',
+                    'goals_for', 'goals_against', 'goal_diff', 'points'
+                ]
+                combined_standings_df = combined_standings_df[cols]
+                
+                combined_file = standings_data_dir / f"standings_{file_country}_{file_season}.csv"
+                combined_standings_df.to_csv(combined_file, index=False)
+                logger.info(f"   ✅ Saved combined standings")
+                logger.info(f"   📁 File: {combined_file.name}\n")
+            
+            # Store in memory
+            if file_country not in all_standings:
+                all_standings[file_country] = {}
+            all_standings[file_country][file_season] = standings
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing {stem}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    return all_standings
 
-    # ─────────────────────────────────────────
-    # Step 2: Preprocessing
-    # ─────────────────────────────────────────
-    logger.info("=== Step 2/5: Loading & preprocessing ===")
 
-    raw_df = load_all_raw(raw_dir)
-
-    if raw_df is None or raw_df.empty:
-        logger.error("❌ No raw data found. Pipeline aborted.")
-        return
-
-    clean_df = clean_matches(raw_df)
-    save_processed(clean_df, clean_path)
-
-    logger.info(f"Clean data shape: {clean_df.shape}")
-
-    # ─────────────────────────────────────────
-    # Step 3: Base Features
-    # ─────────────────────────────────────────
-    logger.info("=== Step 3/5: Base features ===")
-
-    features_cfg = cfg["features"]
-
-    feature_df = build_features(
-        df=clean_df,
-        form_window=features_cfg["form_window"],
-        elo_k_factor=features_cfg["elo_k_factor"],
-        elo_initial_rating=features_cfg["elo_initial_rating"],
-        elo_home_advantage=features_cfg["elo_home_advantage"],
+def run_pipeline(config_path: str = "configs/config.yaml") -> dict:
+    """
+    Main entry point for the entire data preprocessing pipeline.
+    
+    Parameters:
+    -----------
+    config_path : str
+        Path to config YAML file
+        
+    Returns:
+    --------
+    result : dict
+        {
+            'all_standings': dict,
+            'processed_dir': Path,
+            'standings_dir': Path,
+            'summary': dict
+        }
+    """
+    
+    # Load config
+    logger.info(f"Loading config from {config_path}...")
+    config = load_config(config_path)
+    
+    raw_data_dir = Path(config["data"]["raw_dir"])
+    processed_data_dir = Path(config["data"]["processed_dir"])
+    standings_data_dir = processed_data_dir / "standings"
+    
+    logger.info(f"Raw data directory: {raw_data_dir}")
+    logger.info(f"Processed data directory: {processed_data_dir}")
+    logger.info(f"Standings directory: {standings_data_dir}\n")
+    
+    # Run preprocessing and standings building
+    all_standings = preprocess_and_build_standings(
+        raw_data_dir=raw_data_dir,
+        processed_data_dir=processed_data_dir,
+        standings_data_dir=standings_data_dir,
+        overwrite=False,
     )
-
-    # ─────────────────────────────────────────
-    # Step 4: Advanced Layers
-    # ─────────────────────────────────────────
-    logger.info("=== Step 4/5: Advanced features ===")
-
-    # 🔥 LIVE PRESSURE INDEX
-    try:
-        logger.info("Fetching LIVE standings...")
-
-        standings_api = LiveStandings()
-        standings_df = standings_api.get_standings()
-
-        if "week" in feature_df.columns:
-            current_week = int(feature_df["week"].max())
-        else:
-            current_week = 38  # fallback
-
-        feature_df = add_pressure_features(
-            feature_df,
-            standings_by_week={current_week: standings_df},
-            season_weeks=38,
-        )
-
-        logger.success("✅ Pressure index added using LIVE standings")
-
-    except Exception as exc:
-        logger.warning(f"⚠️ Live standings failed → fallback pressure: {exc}")
-        feature_df["pressure_index_home"] = 0.5
-        feature_df["pressure_index_away"] = 0.5
-
-    # 🔥 Advanced features
-    feature_df = add_advanced_features(feature_df)
-
-    # 🔥 Temporal features
-    feature_df = add_temporal_features(feature_df)
-
-    # ─────────────────────────────────────────
-    # Step 5: Validation + Save
-    # ─────────────────────────────────────────
-    logger.info("=== Step 5/5: Validation & saving ===")
-
-    _validate_features(feature_df)
-
-    feature_df = feature_df.fillna(0)
-
-    save_processed(feature_df, feature_path)
-
-    logger.success(
-        f"""
-🎯 PIPELINE COMPLETE (v2 - LIVE)
-
-Rows        : {len(feature_df)}
-Columns     : {len(feature_df.columns)}
-
-Files:
-✔ Clean     → {clean_path}
-✔ Features  → {feature_path}
-"""
-    )
+    
+    # ─── Print Summary ────────────────────────────────────────────────────────
+    logger.info(f"\n{'='*100}")
+    logger.info(f"{'PIPELINE EXECUTION COMPLETE':^100}")
+    logger.info(f"{'='*100}\n")
+    
+    summary = {}
+    for country in sorted(all_standings.keys()):
+        for season in sorted(all_standings[country].keys()):
+            matchdays = len(all_standings[country][season])
+            key = f"{country}_{season}"
+            summary[key] = matchdays
+            logger.info(f"✅ {country} {season}: {matchdays} matchdays")
+    
+    logger.info(f"\n{'📊 OUTPUT DIRECTORY STRUCTURE':^100}")
+    logger.info(f"{'='*100}\n")
+    logger.info(f"data/processed/")
+    logger.info(f"├── matches_E0_2022_23.csv")
+    logger.info(f"├── matches_E0_2021_22.csv")
+    logger.info(f"├── matches_D1_2022_23.csv")
+    logger.info(f"├── ... (all preprocessed match data)")
+    logger.info(f"└── standings/")
+    logger.info(f"    ├── standings_E0_2022_23.csv (combined all matchdays)")
+    logger.info(f"    ├── standings_E0_2021_22.csv")
+    logger.info(f"    ├── standings_D1_2022_23.csv")
+    logger.info(f"    ├── E0/")
+    logger.info(f"    │   ├── 2022_23/")
+    logger.info(f"    │   │   ├── matchday_01.csv")
+    logger.info(f"    │   │   ├── matchday_02.csv")
+    logger.info(f"    │   │   └── ... (38 files for EPL)")
+    logger.info(f"    │   └── 2021_22/")
+    logger.info(f"    │       └── ... (matchday tables)")
+    logger.info(f"    └── D1/")
+    logger.info(f"        └── 2022_23/")
+    logger.info(f"            └── ... (matchday tables)\n")
+    
+    return {
+        'all_standings': all_standings,
+        'processed_dir': processed_data_dir,
+        'standings_dir': standings_data_dir,
+        'summary': summary,
+    }
 
 
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
-
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    run_pipeline()
+    result = run_pipeline()

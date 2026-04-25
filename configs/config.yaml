@@ -122,14 +122,14 @@ api:
   host: "0.0.0.0"
   port: 8000
   reload: true
-
+  football_data_api_key: "67c2c3da7a974c33b3ec923bbb98bdb8"
   model_path: "models/ensemble_model.joblib"
   scaler_path: "models/scaler.joblib"
 
   # NEW 🔥 Live standings integration
   standings:
     enabled: true
-    api_url: "YOUR_STANDINGS_API_URL"
+    api_url: "http://api.football-data.org/v4/competitions/PL/standings"
     timeout: 5
 
 

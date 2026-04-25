@@ -39,7 +39,7 @@ advanced:
     alpha: 0.5   # EWMA decay factor
 
   home_away_splits:
-    enabled: false  # can be enabled when sufficient home/away data available
+    enabled: false  # enable when sufficient home/away data available
 
 # ── Tier 3: Interaction Features ──────────────────────────────
 interactions:
@@ -72,7 +72,7 @@ temporal:
     enabled: true
     window: 5
 
-# ── Match Importance ──────────────────────────────────────────
+# ── Match Importance / Pressure Index ────────────────────────
 match_importance:
   enabled: true
   season_weeks: 38
@@ -84,9 +84,35 @@ match_importance:
     top4_spots: 4
     relegation_spots: 3
 
-# ── Feature selection ─────────────────────────────────────────
+  # Form multiplier — scales how much the live API "form" string
+  # nudges the gap-based pressure score (range 0.0 → disabled, default 0.15)
+  form_scale: 0.15
+
+# ── Rolling Standings ─────────────────────────────────────────
+rolling_standings:
+  # Patch the latest week snapshot with live data from football-data.org
+  patch_current_week: true
+
+  # Which team name field from the API to use as the join key.
+  # Must match the values in your home_team / away_team columns.
+  #   "short_name"  → "Man City"            (recommended default)
+  #   "name"        → "Manchester City FC"
+  #   "tla"         → "MCI"
+  team_name_col: "short_name"
+
+  # API endpoint (override only if targeting a different competition)
+  api_url: "https://api.football-data.org/v4/competitions/PL/standings"
+
+  # HTTP timeout in seconds for the live standings request
+  api_timeout: 10
+
+  # Set to false in backtesting / evaluation to prevent live data leakage
+  # (pipeline.py passes this automatically; set manually for custom scripts)
+  # patch_current_week is overridden to false by rolling_backtest.py
+
+# ── Feature Selection ─────────────────────────────────────────
 selection:
-  # Features exported for model training (Tier 1)
+  # Tier 1 — always present after base feature engineering
   core_features:
     - home_elo
     - away_elo
@@ -107,7 +133,7 @@ selection:
     - home_corners_avg
     - away_corners_avg
 
-  # Additional advanced features (Tier 2-4, added when available)
+  # Tier 2–4 — added when the relevant modules run successfully
   advanced_features:
     - home_attack_adj
     - away_attack_adj
@@ -119,9 +145,9 @@ selection:
     - away_form_ewma
     - home_win_streak
     - away_win_streak
-    - pressure_index_home
+    - pressure_index_home        # from match_importance + live standings
     - pressure_index_away
-    - home_pressure_form
+    - home_pressure_form         # pressure_index × form interaction
     - away_pressure_form
-    - attack_vs_defence
-    - elo_pressure_interaction
+    - attack_vs_defence          # home_attack_adj / away_defence_adj
+    - elo_pressure_interaction   # elo_diff × pressure differential

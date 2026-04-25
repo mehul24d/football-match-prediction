@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import yaml
 from loguru import logger
 
@@ -81,3 +82,38 @@ def setup_logging(log_level: str = "INFO", log_dir: str | Path | None = None) ->
             rotation="1 day",
             retention="30 days",
         )
+
+
+def print_standings_report(
+    standings_by_week: dict[int, pd.DataFrame],
+    season: str | int = "Current",
+    specific_weeks: list[int] | None = None,
+) -> None:
+    """
+    Print detailed standings report for season.
+    
+    Usage:
+    ------
+    from src.features.rolling_standings import build_rolling_standings
+    from src.utils.helpers import print_standings_report
+    
+    standings = build_rolling_standings(df, print_every_week=False)
+    print_standings_report(standings, specific_weeks=[20, 25, 30])
+    """
+    from src.features.rolling_standings import print_league_table, print_standings_by_week
+
+    if not standings_by_week:
+        logger.warning("No standings data available")
+        return
+
+    print(f"\n{'*'*80}")
+    print(f"{'SEASON ' + str(season) + ' - STANDINGS REPORT':^80}")
+    print(f"{'*'*80}\n")
+
+    if specific_weeks:
+        for week in specific_weeks:
+            if week in standings_by_week:
+                print_league_table(standings_by_week[week], week=week)
+    else:
+        # Print last 5 weeks
+        print_standings_by_week(standings_by_week)

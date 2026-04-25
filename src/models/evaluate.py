@@ -6,11 +6,11 @@ Robust evaluation utilities for match prediction models.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Optional
-
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Any, Optional
 from loguru import logger
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
@@ -128,7 +128,7 @@ def shap_feature_importance(
         logger.warning("TreeExplainer failed, falling back to KernelExplainer.")
         background = shap.sample(X_sample, 100)
         explainer = shap.KernelExplainer(model.predict_proba, background)
-        shap_values = explainer.shap_values(X_sample[:200])  # limit for speed
+        shap_values = explainer.shap_values(X_sample[:200])
 
     # Handle multi-class output safely
     if isinstance(shap_values, list):
@@ -143,23 +143,17 @@ def shap_feature_importance(
     }).sort_values("importance_mean_abs", ascending=False).head(max_display)
 
     if output_dir:
-        import matplotlib.pyplot as plt
-
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         plt.figure(figsize=(10, 6))
-        plt.barh(
-            importance_df["feature"][::-1],
-            importance_df["importance_mean_abs"][::-1],
-        )
+        plt.barh(importance_df["feature"], importance_df["importance_mean_abs"])
         plt.xlabel("Mean |SHAP value|")
-        plt.title("Feature Importance (SHAP)")
+        plt.title("SHAP Feature Importance")
         plt.tight_layout()
-        plt.savefig(output_dir / "shap_importance.png", dpi=150)
+        plt.savefig(output_dir / "shap_importance.png", dpi=100, bbox_inches="tight")
         plt.close()
-
-        logger.info(f"SHAP plot saved to {output_dir / 'shap_importance.png'}")
+        logger.success(f"✅ SHAP plot saved to {output_dir / 'shap_importance.png'}")
 
     return importance_df
 
@@ -173,13 +167,8 @@ def compare_models(
 
     rows = []
     for name, metrics in results.items():
-        rows.append({
-            "model": name,
-            "accuracy": metrics.get("accuracy"),
-            "log_loss": metrics.get("log_loss"),
-            "brier_score": metrics.get("brier_score"),
-            "cv_accuracy": metrics.get("cv_accuracy_mean"),
-        })
+        row = {"model": name, **metrics}
+        rows.append(row)
 
     df = pd.DataFrame(rows)
 
