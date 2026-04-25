@@ -105,7 +105,9 @@ class PredictionResponse(BaseModel):
     draw_prob: float = Field(..., ge=0, le=1)
     away_win_prob: float = Field(..., ge=0, le=1)
     predicted_outcome: str
-    model_version: str = "1.0.0"
+    model_version: str = "2.0.0"
+    pressure_index_home: Optional[float] = Field(None, ge=0, le=1, description="Match importance / pressure index for the home team")
+    pressure_index_away: Optional[float] = Field(None, ge=0, le=1, description="Match importance / pressure index for the away team")
 
     model_config = {"json_schema_extra": {
         "example": {

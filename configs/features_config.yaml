@@ -1,0 +1,127 @@
+# ─────────────────────────────────────────────────────────────
+# Feature Engineering Configuration
+# ─────────────────────────────────────────────────────────────
+
+# ── Tier 1: Core Features ─────────────────────────────────────
+core:
+  elo:
+    k_factor: 32
+    initial_rating: 1500
+    home_advantage: 100
+
+  form:
+    window: 5
+    time_decay_half_life: 30  # days
+
+  rolling_stats:
+    window: 5
+    columns:
+      - goals_scored
+      - goals_conceded
+      - shots
+      - shots_on_target
+      - corners
+      - fouls
+
+# ── Tier 2: Advanced Features ─────────────────────────────────
+advanced:
+  opponent_adjusted:
+    enabled: true
+    window: 5
+
+  tactical:
+    enabled: true
+    window: 5
+
+  weighted_form:
+    enabled: true
+    window: 5
+    alpha: 0.5   # EWMA decay factor
+
+  home_away_splits:
+    enabled: false  # can be enabled when sufficient home/away data available
+
+# ── Tier 3: Interaction Features ──────────────────────────────
+interactions:
+  enabled: true
+  features:
+    - attack_vs_defence        # home attack adj / away defence adj
+    - pressure_form            # pressure_index × form
+    - elo_pressure             # elo_diff × pressure differential
+
+# ── Tier 4: Temporal Features ─────────────────────────────────
+temporal:
+  lag_features:
+    enabled: true
+    lags: [1, 2, 3]
+    columns:
+      - home_goals_scored_avg
+      - home_goals_conceded_avg
+      - home_form
+
+  ewma:
+    enabled: true
+    span: 5
+    columns:
+      - home_goals_scored_avg
+      - away_goals_scored_avg
+      - home_form
+      - away_form
+
+  momentum:
+    enabled: true
+    window: 5
+
+# ── Match Importance ──────────────────────────────────────────
+match_importance:
+  enabled: true
+  season_weeks: 38
+  thresholds:
+    title_gap: 5
+    top4_gap: 3
+    relegation_gap: 3
+    n_teams: 20
+    top4_spots: 4
+    relegation_spots: 3
+
+# ── Feature selection ─────────────────────────────────────────
+selection:
+  # Features exported for model training (Tier 1)
+  core_features:
+    - home_elo
+    - away_elo
+    - elo_diff
+    - home_form
+    - away_form
+    - form_diff
+    - home_form_decayed
+    - away_form_decayed
+    - home_goals_scored_avg
+    - home_goals_conceded_avg
+    - away_goals_scored_avg
+    - away_goals_conceded_avg
+    - home_shots_avg
+    - away_shots_avg
+    - home_shots_on_target_avg
+    - away_shots_on_target_avg
+    - home_corners_avg
+    - away_corners_avg
+
+  # Additional advanced features (Tier 2-4, added when available)
+  advanced_features:
+    - home_attack_adj
+    - away_attack_adj
+    - home_defence_adj
+    - away_defence_adj
+    - home_conversion_rate
+    - away_conversion_rate
+    - home_form_ewma
+    - away_form_ewma
+    - home_win_streak
+    - away_win_streak
+    - pressure_index_home
+    - pressure_index_away
+    - home_pressure_form
+    - away_pressure_form
+    - attack_vs_defence
+    - elo_pressure_interaction
